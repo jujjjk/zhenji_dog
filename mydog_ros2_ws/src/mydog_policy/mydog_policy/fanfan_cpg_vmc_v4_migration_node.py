@@ -132,6 +132,7 @@ class FanfanV4MigrationNode(Node):
         self._csv_header = None
         self._csv_rows_since_flush = 0
         self._csv_rows_written = 0
+        self._csv_tick = 0
         self._last_csv_write_ms = 0.0
         self._open_csv()
 
@@ -197,6 +198,7 @@ class FanfanV4MigrationNode(Node):
         p("csv_path", "")
         p("csv_flush_every_n", 20)
         p("csv_light", False)
+        p("csv_log_every_n", 1)
         p("stop_roll_deg", 12.0)
         p("stop_pitch_deg", 12.0)
         p("stop_q_error_rad", 0.45)
@@ -260,6 +262,7 @@ class FanfanV4MigrationNode(Node):
         self.csv_path = str(g("csv_path"))
         self.csv_flush_every_n = max(1, int(g("csv_flush_every_n")))
         self.csv_light = bool(g("csv_light")) and self.test_mode != "sim_compare"
+        self.csv_log_every_n = max(1, int(g("csv_log_every_n")))
         self.stop_roll_deg = float(g("stop_roll_deg"))
         self.stop_pitch_deg = float(g("stop_pitch_deg"))
         self.stop_q_error_rad = float(g("stop_q_error_rad"))
@@ -524,6 +527,7 @@ class FanfanV4MigrationNode(Node):
             "csv_write_ms": self._last_csv_write_ms,
             "total_loop_ms": 0.0,
         }
+        timing["pre_csv_loop_ms"] = (time.perf_counter() - loop_t0) * 1000.0
         csv_t0 = time.perf_counter()
         self._write_csv_row(rel_core, dt, debug, feedback, fb_sim, imu, safety,
                             q_cmd_real_policy, target_real, sent, cmp, timing)
@@ -857,6 +861,9 @@ class FanfanV4MigrationNode(Node):
             "csv_write_ms": self._last_csv_write_ms,
             "total_loop_ms": 0.0,
         }
+        timing["pre_csv_loop_ms"] = (
+            (time.perf_counter() - loop_t0) * 1000.0 if loop_t0 is not None else 0.0
+        )
         csv_t0 = time.perf_counter()
         self._write_csv_row(rel, dt, debug, feedback, fb_sim, imu, safety,
                             q_cmd_real_policy, target_real, sent, None, timing)
@@ -1032,6 +1039,9 @@ class FanfanV4MigrationNode(Node):
                     "spi_total_ms": float(data.get("spi_send_ms", float("nan"))),
                     "num_spi_frames": int(data.get("num_spi_frames", 0)),
                     "num_can_frames": int(data.get("num_can_frames", 0)),
+                    "actual_send_hz": float(data.get("actual_send_hz", float("nan"))),
+                    "send_period_p95_ms": float(data.get("send_period_p95_ms", float("nan"))),
+                    "send_period_max_ms": float(data.get("send_period_max_ms", float("nan"))),
                 }
             except Exception:
                 self._last_motion_stats = {}
@@ -1139,7 +1149,10 @@ class FanfanV4MigrationNode(Node):
         self._csv_path_out = path
         self._csv_file = open(path, "w", newline="", encoding="utf-8")
         self._csv_writer = csv.writer(self._csv_file)
-        self.get_logger().info(f"[CSV] writing -> {path}")
+        self.get_logger().info(
+            f"[CSV] writing -> {path} light={self.csv_light} "
+            f"log_every_n={self.csv_log_every_n} flush_every_n={self.csv_flush_every_n}"
+        )
 
     def _build_row(self, rel, dt, debug, feedback, fb_sim, imu, safety, q_cmd_real_policy, target_real, sent, cmp, timing=None):
         cols = []
@@ -1181,6 +1194,7 @@ class FanfanV4MigrationNode(Node):
         s("send_motion_ms", timing.get("send_motion_ms", 0.0))
         s("csv_write_ms", timing.get("csv_write_ms", 0.0))
         s("total_loop_ms", timing.get("total_loop_ms", 0.0))
+        s("pre_csv_loop_ms", timing.get("pre_csv_loop_ms", 0.0))
         s("test_mode", self.test_mode)
         s("enable_send", int(self.enable_send))
         s("node_state", debug.get("node_state", self.node_state if not self.soft_stop_active else "soft_stop"))
@@ -1350,16 +1364,21 @@ class FanfanV4MigrationNode(Node):
         s("spi_total_ms", motion_stats.get("spi_total_ms", float("nan")))
         s("num_spi_frames", motion_stats.get("num_spi_frames", 0))
         s("num_can_frames", motion_stats.get("num_can_frames", 0))
+        s("actual_send_hz", motion_stats.get("actual_send_hz", float("nan")))
+        s("send_period_p95_ms", motion_stats.get("send_period_p95_ms", float("nan")))
+        s("send_period_max_ms", motion_stats.get("send_period_max_ms", float("nan")))
         return cols
 
     def _is_light_csv_col(self, name: str) -> bool:
         exact = {
             "time", "relative_time", "dt", "loop_wall_dt", "feedback_read_ms",
             "core_step_ms", "send_motion_ms", "csv_write_ms", "total_loop_ms",
+            "pre_csv_loop_ms",
             "node_state", "phase", "active_swing_pair", "max_q_error",
             "max_tau_est", "max_current", "max_temp", "safety_stop",
             "stop_reason", "sent", "communication_ok", "real_vmc_scale",
             "api_total_ms", "spi_total_ms", "num_spi_frames", "num_can_frames",
+            "actual_send_hz", "send_period_p95_ms", "send_period_max_ms",
         }
         prefixes = (
             "q_cmd_final_sim_", "q_actual_sim_", "q_error_sim_",
@@ -1367,10 +1386,85 @@ class FanfanV4MigrationNode(Node):
         )
         return name in exact or any(name.startswith(prefix) for prefix in prefixes)
 
+    def _build_light_row(self, rel, dt, debug, safety, sent, timing=None):
+        """Build deployment diagnostics directly, without constructing the full CSV row."""
+        cols = []
+        timing = timing or {}
+
+        def s(name, value):
+            cols.append((name, value))
+
+        def vec_joint(name, arr):
+            arr = np.asarray(arr).reshape(12)
+            cols.extend(
+                (f"{name}_{joint_name}", float(arr[i]))
+                for i, joint_name in enumerate(POLICY_JOINT_NAMES)
+            )
+
+        def vec_leg(name, arr):
+            arr = np.asarray(arr).reshape(4)
+            cols.extend(
+                (f"{name}_{leg_name}", float(arr[i]))
+                for i, leg_name in enumerate(POLICY_LEG_ORDER)
+            )
+
+        s("time", time.time())
+        s("relative_time", rel)
+        s("dt", dt)
+        s("loop_wall_dt", timing.get("loop_wall_dt", dt))
+        s("feedback_read_ms", timing.get("feedback_read_ms", 0.0))
+        s("core_step_ms", timing.get("core_step_ms", 0.0))
+        s("send_motion_ms", timing.get("send_motion_ms", 0.0))
+        s("csv_write_ms", timing.get("csv_write_ms", 0.0))
+        s("total_loop_ms", timing.get("total_loop_ms", 0.0))
+        s("pre_csv_loop_ms", timing.get("pre_csv_loop_ms", 0.0))
+        s("node_state", debug.get(
+            "node_state", self.node_state if not self.soft_stop_active else "soft_stop"
+        ))
+        s("phase", debug["phase"])
+        s("active_swing_pair", debug["active_swing_pair"])
+
+        vec_joint("q_cmd_final_sim", debug["q_cmd_final_sim"])
+        vec_joint("q_actual_sim", debug["q_actual_sim"])
+        vec_joint("q_error_sim", debug["q_error_sim"])
+        vec_leg("fk_clearance_actual", debug["fk_clearance_actual"])
+        s("real_vmc_scale", debug["real_vmc_scale"])
+        vec_joint("kp", debug["kp_sim"])
+        vec_joint("kd", debug["kd_sim"])
+
+        s("max_q_error", safety["max_q_error"])
+        s("max_tau_est", safety["max_tau_est"])
+        s("max_current", safety["max_current"])
+        s("max_temp", safety["max_temp"])
+        s("safety_stop", int(safety["safety_stop"]))
+        s("stop_reason", self.stop_reason)
+        s("sent", int(bool(sent)))
+        s("communication_ok", int(safety["communication_ok"]))
+
+        motion_stats = getattr(self, "_last_motion_stats", {}) or {}
+        for name, default in (
+            ("api_total_ms", float("nan")),
+            ("spi_total_ms", float("nan")),
+            ("num_spi_frames", 0),
+            ("num_can_frames", 0),
+            ("actual_send_hz", float("nan")),
+            ("send_period_p95_ms", float("nan")),
+            ("send_period_max_ms", float("nan")),
+        ):
+            s(name, motion_stats.get(name, default))
+        return cols
+
     def _write_csv_row(self, rel, dt, debug, feedback, fb_sim, imu, safety, q_cmd_real_policy, target_real, sent, cmp, timing=None):
-        cols = self._build_row(rel, dt, debug, feedback, fb_sim, imu, safety, q_cmd_real_policy, target_real, sent, cmp, timing)
+        self._csv_tick += 1
+        if (self._csv_tick - 1) % self.csv_log_every_n != 0:
+            return
         if self.csv_light:
-            cols = [c for c in cols if self._is_light_csv_col(c[0])]
+            cols = self._build_light_row(rel, dt, debug, safety, sent, timing)
+        else:
+            cols = self._build_row(
+                rel, dt, debug, feedback, fb_sim, imu, safety,
+                q_cmd_real_policy, target_real, sent, cmp, timing,
+            )
         if self._csv_header is None:
             self._csv_header = [c[0] for c in cols]
             self._csv_writer.writerow(self._csv_header)

@@ -597,6 +597,7 @@ class MydogPolicyNode(Node):
             self.calf_target_accel_mul,
         )
         self._last_cmd_log_time = 0.0
+        self._last_send_ok_log_time = 0.0
         self._last_debug_print_time = 0.0
         self._last_debug_csv_time = 0.0
         self._smooth_target_real = None
@@ -611,6 +612,7 @@ class MydogPolicyNode(Node):
         self._last_delta_q_rl_policy = np.zeros(12, dtype=np.float32)
         self._last_cpg_info = {}
         self._stand_mapper = JointSemanticMapper()
+        self.http_session = requests.Session()
         self._mode_start_time = time.time()
         self._stand_only_done_logged = False
         self._joint_probe_last_state = None
@@ -1766,7 +1768,7 @@ class MydogPolicyNode(Node):
         url = f"{self.motor_base_url}/api/rs04/motion_mode_run_batch"
 
         try:
-            r = requests.post(
+            r = self.http_session.post(
                 url,
                 json=payload,
                 timeout=max(self.http_timeout, 0.5),
@@ -1836,7 +1838,7 @@ class MydogPolicyNode(Node):
         url = f"{self.motor_base_url}/api/rs04/motion_batch_fast"
 
         try:
-            r = requests.post(
+            r = self.http_session.post(
                 url,
                 json=payload,
                 timeout=self.http_timeout,
@@ -1853,12 +1855,15 @@ class MydogPolicyNode(Node):
                 if self.log_motor_vel_cmd
                 else ""
             )
-            self.get_logger().info(
-                f"[SEND] motion batch ok | "
-                f"max_delta={max_delta:.3f} | "
-                f"{vel_log}"
-                f"kp={self.send_kp:.2f} kd={self.send_kd:.2f}"
-            )
+            now = time.monotonic()
+            if now - self._last_send_ok_log_time >= 1.0:
+                self._last_send_ok_log_time = now
+                self.get_logger().info(
+                    f"[SEND] motion batch ok | "
+                    f"max_delta={max_delta:.3f} | "
+                    f"{vel_log}"
+                    f"kp={self.send_kp:.2f} kd={self.send_kd:.2f}"
+                )
             return True
 
         except Exception as e:
@@ -2655,6 +2660,10 @@ class MydogPolicyNode(Node):
             pass
         try:
             self.obs_builder.stop()
+        except Exception:
+            pass
+        try:
+            self.http_session.close()
         except Exception:
             pass
         super().destroy_node()

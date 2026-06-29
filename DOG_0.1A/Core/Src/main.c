@@ -38,7 +38,7 @@
 /* USER CODE BEGIN PTD */
 
 /* USER CODE BEGIN PD */
-#define BOARD_IS_A              0
+#define BOARD_IS_A              1
 #define MASTER_CAN_ID           0x00FD
 
 #define SPI_FRAME_LEN           96
@@ -47,8 +47,13 @@
 #define SPI_OP_NOP              0x00
 #define SPI_OP_SEND_CAN_RAW     0x10
 #define SPI_OP_REINIT_REPORTS   0x11
+#define SPI_OP_SEND_CAN_BATCH   0x12
+#define SPI_BATCH_HEADER_LEN    4U
+#define SPI_BATCH_ENTRY_LEN     13U
+#define SPI_BATCH_MAX_ENTRIES   7U
 
 #define SNAPSHOT_MAGIC          0x5A
+#define SNAPSHOT_CAP_BATCH_CAN  (1UL << 0)
 #define ONLINE_TIMEOUT_MS       100U
 #define REPORT_RETRY_MS         1000U
 #define REPORT_STALE_MS         500U
@@ -286,9 +291,8 @@ static void fdcan_accept_all_rx(void)
     }
 }
 
-static void motor_config_reports_all(void)
+static void motor_config_reports_one(int i)
 {
-    for (int i = 0; i < 6; i++) {
         uint8_t id = BOARD_MOTOR_IDS[i];
 
         // 1) 关闭 can timeout，避免没收到控制指令就掉回 reset
@@ -302,6 +306,12 @@ static void motor_config_reports_all(void)
         // 3) 打开主动上报
         motor_set_active_report(id, 1);
         HAL_Delay(2);
+}
+
+static void motor_config_reports_all(void)
+{
+    for (int i = 0; i < 6; i++) {
+        motor_config_reports_one(i);
     }
 }
 
@@ -394,7 +404,7 @@ static void prepare_snapshot_frame(void)
     snap.board_tag     = BOARD_TAG;
     snap.seq           = ++g_snapshot_seq;
     snap.board_tick_ms = now_ms;
-    snap.reserved      = 0;
+    snap.reserved      = SNAPSHOT_CAP_BATCH_CAN;
 
     for (int i = 0; i < 6; i++) {
         fill_one_motor_snapshot(&snap.motors[i], &local[i], now_ms);
@@ -424,6 +434,24 @@ static void handle_spi_command(const uint8_t *rx)
         memcpy(data, &rx[8], 8);
 
         can_send_ext(port, ext_id, data);
+        break;
+    }
+
+    case SPI_OP_SEND_CAN_BATCH:
+    {
+        uint8_t count = rx[2];
+        if (count > SPI_BATCH_MAX_ENTRIES) {
+            count = SPI_BATCH_MAX_ENTRIES;
+        }
+        for (uint8_t i = 0; i < count; i++) {
+            uint32_t offset = SPI_BATCH_HEADER_LEN + ((uint32_t)i * SPI_BATCH_ENTRY_LEN);
+            uint8_t port = rx[offset];
+            uint32_t ext_id = 0;
+            uint8_t data[8];
+            memcpy(&ext_id, &rx[offset + 1U], 4);
+            memcpy(data, &rx[offset + 5U], 8);
+            can_send_ext(port, ext_id, data);
+        }
         break;
     }
 
@@ -504,6 +532,7 @@ int main(void)
   
   
   uint32_t last_report_retry_ms = 0U;
+  uint8_t next_report_retry_motor = 0U;
 
   while (1)
   {
@@ -523,7 +552,16 @@ int main(void)
     if ((now - last_report_retry_ms) > REPORT_RETRY_MS) {
         last_report_retry_ms = now;
         if (any_motor_feedback_stale(now)) {
-            motor_config_reports_all();
+            /* Repair one motor per pass. Repairing all six blocks SPI ~36 ms. */
+            for (uint8_t step = 0U; step < 6U; step++) {
+                uint8_t i = (uint8_t)((next_report_retry_motor + step) % 6U);
+                if ((g_motors[i].last_ms == 0U) ||
+                    ((now - g_motors[i].last_ms) > REPORT_STALE_MS)) {
+                    motor_config_reports_one(i);
+                    next_report_retry_motor = (uint8_t)((i + 1U) % 6U);
+                    break;
+                }
+            }
         }
     }
 
@@ -610,22 +648,22 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
         return;
     }
 
-    if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &rxHeader, data) != HAL_OK) {
-        return;
+    while (HAL_FDCAN_GetRxFifoFillLevel(hfdcan, FDCAN_RX_FIFO0) > 0U) {
+        if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &rxHeader, data) != HAL_OK) {
+            break;
+        }
+
+        g_fdcan_rx_cnt++;
+        g_last_ext_id   = rxHeader.Identifier;
+        g_last_cmd_type = (rxHeader.Identifier >> 24) & 0x1F;
+        g_last_src_id   = (rxHeader.Identifier >> 8) & 0xFF;
+        g_last_dst_id   = rxHeader.Identifier & 0xFF;
+        memcpy((void *)g_last_data, data, 8);
+
+        if (rxHeader.IdType == FDCAN_EXTENDED_ID) {
+            parse_motor_feedback(rxHeader.Identifier, data);
+        }
     }
-
-    g_fdcan_rx_cnt++;
-    g_last_ext_id   = rxHeader.Identifier;
-    g_last_cmd_type = (rxHeader.Identifier >> 24) & 0x1F;
-    g_last_src_id   = (rxHeader.Identifier >> 8) & 0xFF;
-    g_last_dst_id   = rxHeader.Identifier & 0xFF;
-    memcpy((void *)g_last_data, data, 8);
-
-    if (rxHeader.IdType != FDCAN_EXTENDED_ID) {
-        return;
-    }
-
-    parse_motor_feedback(rxHeader.Identifier, data);
 }
 /* USER CODE END 4 */
 

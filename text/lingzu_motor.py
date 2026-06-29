@@ -45,10 +45,16 @@ SPI_FRAME_LEN     = 96
 SPI_CMD_MAGIC     = 0xFA
 SPI_OP_NOP        = 0x00
 SPI_OP_SEND_CAN   = 0x10
+SPI_OP_SEND_CAN_BATCH = 0x12
+
+SPI_BATCH_HEADER_LEN = 4
+SPI_BATCH_ENTRY_LEN = 13
+SPI_BATCH_MAX_ENTRIES = (SPI_FRAME_LEN - SPI_BATCH_HEADER_LEN) // SPI_BATCH_ENTRY_LEN
 
 SNAPSHOT_MAGIC    = 0x5A
 BOARD_A_TAG       = 0xA1
 BOARD_B_TAG       = 0xB1
+SNAPSHOT_CAP_BATCH_CAN = 1 << 0
 
 DEFAULT_SPI_MAX_SPEED_HZ = int(os.environ.get("LINGZU_SPI_MAX_SPEED_HZ", "4000000"))
 DEFAULT_SPI_PERSISTENT_OPEN = os.environ.get("LINGZU_SPI_PERSISTENT_OPEN", "1").lower() not in ("0", "false", "no")
@@ -110,6 +116,27 @@ def build_spi_can_frame(can_port: int, ext_id: int, data8: bytes) -> bytes:
     return bytes(frame)
 
 
+def build_spi_can_batch_frame(entries) -> bytes:
+    """Pack up to six CAN frames for one STM32 into one SPI transaction."""
+    entries = list(entries)
+    if not 1 <= len(entries) <= SPI_BATCH_MAX_ENTRIES:
+        raise ValueError(f"batch must contain 1..{SPI_BATCH_MAX_ENTRIES} CAN frames")
+
+    frame = bytearray(SPI_FRAME_LEN)
+    frame[0] = SPI_CMD_MAGIC
+    frame[1] = SPI_OP_SEND_CAN_BATCH
+    frame[2] = len(entries)
+    offset = SPI_BATCH_HEADER_LEN
+    for can_port, ext_id, data8 in entries:
+        if len(data8) != 8:
+            raise ValueError("CAN data must be 8 bytes")
+        frame[offset] = int(can_port) & 0xFF
+        frame[offset + 1:offset + 5] = int(ext_id).to_bytes(4, "little")
+        frame[offset + 5:offset + 13] = bytes(data8)
+        offset += SPI_BATCH_ENTRY_LEN
+    return bytes(frame)
+
+
 @dataclass
 class MotorState:
     can_id: int
@@ -125,6 +152,7 @@ class MotorState:
     board_tag: int = 0
     snapshot_seq: int = 0
     board_tick_ms: int = 0
+    board_capabilities: int = 0
 
 
 class SPITransport:
@@ -243,6 +271,7 @@ class LingZuMotorController:
 
         seq = struct.unpack_from("<H", frame, 2)[0]
         board_tick_ms = struct.unpack_from("<I", frame, 4)[0]
+        capabilities = struct.unpack_from("<I", frame, 92)[0]
 
         motors = []
         offset = 8
@@ -267,6 +296,7 @@ class LingZuMotorController:
             "board_tag": frame[1],
             "seq": seq,
             "board_tick_ms": board_tick_ms,
+            "capabilities": capabilities,
             "motors": motors,
         }
 
@@ -294,16 +324,17 @@ class LingZuMotorController:
                 ctrl.state.board_tag = snap["board_tag"]
                 ctrl.state.snapshot_seq = snap["seq"]
                 ctrl.state.board_tick_ms = snap["board_tick_ms"]
-    def refresh_board_snapshot(self):
+                ctrl.state.board_capabilities = snap["capabilities"]
+    def refresh_board_snapshot(self, read_count=1, inter_read_delay_s=0.0):
         target, _ = motor_to_target_and_port(self.motor_id)
 
-        rx1 = self.transport.exchange_frame(target, build_spi_nop_frame())
-        time.sleep(0.005)
-        rx2 = self.transport.exchange_frame(target, build_spi_nop_frame())
-        time.sleep(0.005)
-        rx3 = self.transport.exchange_frame(target, build_spi_nop_frame())
+        rx = None
+        for index in range(max(1, int(read_count))):
+            rx = self.transport.exchange_frame(target, build_spi_nop_frame())
+            if index + 1 < read_count and inter_read_delay_s > 0.0:
+                time.sleep(inter_read_delay_s)
 
-        snap = self._parse_snapshot_frame(rx3)
+        snap = self._parse_snapshot_frame(rx)
 
         self._apply_snapshot_to_registry(snap)
         return snap
@@ -403,6 +434,12 @@ class LingZuMotorController:
         self.set_param_f32(IDX_IQ_REF, iq_amp)
 
     def motion_control(self, torque: float, position: float, speed: float, kp: float, kd: float):
+        ext_id, data = self.build_motion_control_command(
+            torque=torque, position=position, speed=speed, kp=kp, kd=kd
+        )
+        self._send(ext_id, data)
+
+    def build_motion_control_command(self, torque: float, position: float, speed: float, kp: float, kd: float):
         p_u = float_to_uint(position, P_MIN, P_MAX, 16)
         v_u = float_to_uint(speed,    V_MIN, V_MAX, 16)
         kp_u = float_to_uint(kp,      KP_MIN, KP_MAX, 16)
@@ -420,8 +457,53 @@ class LingZuMotorController:
         data[7] = kd_u & 0xFF
 
         ext_id = build_ext_id(CMD_MOTION_CTRL, t_u, self.motor_id)
-        self._send(ext_id, bytes(data))
+        return ext_id, bytes(data)
 
     def get_state_dict(self):
         with self.lock:
             return asdict(self.state)
+
+
+def send_motion_control_batch(commands) -> int:
+    """Send motion commands using one SPI frame per STM32 board.
+
+    ``commands`` contains ``(controller, torque, position, speed, kp, kd)``.
+    Returns the number of SPI frames sent.
+    """
+    grouped = {}
+    transport = None
+    for ctrl, torque, position, speed, kp, kd in commands:
+        if transport is None:
+            transport = ctrl.transport
+        elif ctrl.transport is not transport:
+            raise ValueError("all batched controllers must share one SPITransport")
+        target, can_port = motor_to_target_and_port(ctrl.motor_id)
+        ext_id, data = ctrl.build_motion_control_command(torque, position, speed, kp, kd)
+        group = grouped.setdefault(target, {"entries": [], "controllers": []})
+        group["entries"].append((can_port, ext_id, data))
+        group["controllers"].append(ctrl)
+
+    frames_sent = 0
+    for target, group in grouped.items():
+        entries = group["entries"]
+        batch_supported = any(
+            ctrl.state.board_capabilities & SNAPSHOT_CAP_BATCH_CAN
+            for ctrl in group["controllers"]
+        )
+        chunks = (
+            [entries[start:start + SPI_BATCH_MAX_ENTRIES]
+             for start in range(0, len(entries), SPI_BATCH_MAX_ENTRIES)]
+            if batch_supported
+            else [[entry] for entry in entries]
+        )
+        for chunk in chunks:
+            payload = (
+                build_spi_can_batch_frame(chunk)
+                if batch_supported
+                else build_spi_can_frame(*chunk[0])
+            )
+            rx = transport.exchange_frame(target, payload)
+            snap = LingZuMotorController._parse_snapshot_frame(rx)
+            LingZuMotorController._apply_snapshot_to_registry(snap)
+            frames_sent += 1
+    return frames_sent

@@ -5,11 +5,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pathlib import Path
+from collections import deque
 import threading
 import time
 import os
 
-from lingzu_motor import LingZuMotorController, SPITransport
+from lingzu_motor import LingZuMotorController, SPITransport, send_motion_control_batch
 
 app = FastAPI(title="RS04 Control API")
 
@@ -34,6 +35,8 @@ app.add_middleware(
 
 # 共享 SPI 传输层，多电机按 motor_id 区分
 STATE_REFRESH_HZ = float(os.environ.get("LINGZU_STATE_REFRESH_HZ", "50"))
+STATE_READ_COUNT = int(os.environ.get("LINGZU_STATE_READ_COUNT", "1"))
+STATE_INTER_READ_DELAY_S = float(os.environ.get("LINGZU_STATE_INTER_READ_DELAY_S", "0"))
 STATE_CACHE_STALE_MS = float(os.environ.get("LINGZU_STATE_CACHE_STALE_MS", "200"))
 SPI_MAX_SPEED_HZ = int(os.environ.get("LINGZU_SPI_MAX_SPEED_HZ", "4000000"))
 SPI_PERSISTENT_OPEN = os.environ.get("LINGZU_SPI_PERSISTENT_OPEN", "1").lower() not in ("0", "false", "no")
@@ -63,6 +66,27 @@ _state_cache_stamp = 0.0
 _state_refresh_dt_ms = float("inf")
 _state_refresh_stop = threading.Event()
 _state_refresh_thread: threading.Thread | None = None
+_control_timing_lock = threading.Lock()
+_control_send_stamps = deque(maxlen=200)
+
+
+def _record_control_send_timing() -> dict:
+    now = time.perf_counter()
+    with _control_timing_lock:
+        if _control_send_stamps and (now - _control_send_stamps[-1]) > 0.5:
+            _control_send_stamps.clear()
+        _control_send_stamps.append(now)
+        stamps = tuple(_control_send_stamps)
+    if len(stamps) < 2:
+        return {"actual_send_hz": 0.0, "send_period_p95_ms": 0.0, "send_period_max_ms": 0.0}
+    periods = [b - a for a, b in zip(stamps, stamps[1:])]
+    ordered = sorted(periods)
+    p95_index = min(len(ordered) - 1, int(0.95 * len(ordered)))
+    return {
+        "actual_send_hz": (len(stamps) - 1) / (stamps[-1] - stamps[0]),
+        "send_period_p95_ms": ordered[p95_index] * 1000.0,
+        "send_period_max_ms": max(periods) * 1000.0,
+    }
 
 
 def _refresh_all_states_legacy_unused():
@@ -73,8 +97,8 @@ def _refresh_all_states_legacy_unused():
 
 def _refresh_all_states():
     t0 = time.perf_counter()
-    snap_a = motors[0x11].refresh_board_snapshot()
-    snap_b = motors[0x31].refresh_board_snapshot()
+    snap_a = motors[0x11].refresh_board_snapshot(STATE_READ_COUNT, STATE_INTER_READ_DELAY_S)
+    snap_b = motors[0x31].refresh_board_snapshot(STATE_READ_COUNT, STATE_INTER_READ_DELAY_S)
     dt_ms = (time.perf_counter() - t0) * 1000.0
     _update_state_cache(dt_ms=dt_ms)
     return {"board_a": snap_a, "board_b": snap_b, "dt_ms": dt_ms}
@@ -135,7 +159,7 @@ def _startup_state_refresh():
     global _state_refresh_thread
     print(
         f"[CONFIG] state_refresh_hz={STATE_REFRESH_HZ} "
-        f"state_cache_stale_ms={STATE_CACHE_STALE_MS} "
+        f"state_cache_stale_ms={STATE_CACHE_STALE_MS} state_read_count={STATE_READ_COUNT} "
         f"spi_max_speed_hz={SPI_MAX_SPEED_HZ} "
         f"spi_persistent_open={SPI_PERSISTENT_OPEN} debug_tx={DEBUG_TX}"
     )
@@ -402,27 +426,32 @@ def rs04_motion_batch_fast(cmd: MotionBatchCmd):
     items = list(cmd.items)
     prepare_ms = (time.perf_counter() - t_prepare) * 1000.0
     t_spi = time.perf_counter()
-    for item in items:
-        _get_motor(item.motor_id).motion_control(
-            torque=item.torque,
-            position=item.position,
-            speed=item.speed,
-            kp=item.kp,
-            kd=item.kd,
-        )
+    commands = [
+        (_get_motor(item.motor_id), item.torque, item.position, item.speed, item.kp, item.kd)
+        for item in items
+    ]
+    num_spi_frames = send_motion_control_batch(commands)
     spi_send_ms = (time.perf_counter() - t_spi) * 1000.0
     total_ms = (time.perf_counter() - t0) * 1000.0
+    timing = _record_control_send_timing()
+    batch_active = num_spi_frames < len(items)
 
     return {
         "ok": True,
         "mode": "motion_batch_fast",
         "count": len(items),
-        "note": "fast path skips mode/enable/sleep but still sends one SPI/CAN frame per motor",
+        "note": (
+            "fast path packs up to six CAN commands into one SPI frame per STM32"
+            if batch_active else
+            "STM32 batch capability not detected; using safe legacy SPI fallback"
+        ),
         "prepare_ms": prepare_ms,
         "spi_send_ms": spi_send_ms,
         "total_ms": total_ms,
-        "num_spi_frames": len(items),
+        "num_spi_frames": num_spi_frames,
         "num_can_frames": len(items),
+        "batch_active": batch_active,
+        **timing,
     }
 # --------------------------
 # Raw Hex (12 bytes) - debug helper
