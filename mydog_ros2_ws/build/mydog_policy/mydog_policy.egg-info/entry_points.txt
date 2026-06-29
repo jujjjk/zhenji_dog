@@ -1,0 +1,11 @@
+[console_scripts]
+fanfan_cpg_vmc_v4_migration_node = mydog_policy.fanfan_cpg_vmc_v4_migration_node:main
+fanfan_cpg_vmc_v4_node = mydog_policy.fanfan_cpg_vmc_v4_node:main
+fanfan_ik_gait_node = mydog_policy.fanfan_ik_gait_node:main
+fanfan_step_in_place_node = mydog_policy.fanfan_step_in_place_node:main
+mydog_joint_semantic_test_node = mydog_policy.joint_semantic_test_node:main
+mydog_openloop_gait_node = mydog_policy.openloop_gait_node:main
+mydog_policy_node = mydog_policy.mydog_policy_node:main
+mydog_soft_body_gait_node = mydog_policy.openloop_gait_node_soft_body_urdf:main
+mydog_state_estimator_node = mydog_policy.state_estimator_node:main
+

@@ -1,0 +1,36 @@
+running develop
+running egg_info
+creating mydog_policy.egg-info
+writing mydog_policy.egg-info/PKG-INFO
+writing dependency_links to mydog_policy.egg-info/dependency_links.txt
+writing entry points to mydog_policy.egg-info/entry_points.txt
+writing requirements to mydog_policy.egg-info/requires.txt
+writing top-level names to mydog_policy.egg-info/top_level.txt
+writing manifest file 'mydog_policy.egg-info/SOURCES.txt'
+reading manifest file 'mydog_policy.egg-info/SOURCES.txt'
+writing manifest file 'mydog_policy.egg-info/SOURCES.txt'
+running build_ext
+Creating /home/jetson/mydog_ros2_ws/install/mydog_policy/lib/python3.10/site-packages/mydog-policy.egg-link (link to .)
+Installing fanfan_cpg_vmc_v4_migration_node script to /home/jetson/mydog_ros2_ws/install/mydog_policy/lib/mydog_policy
+Installing fanfan_cpg_vmc_v4_node script to /home/jetson/mydog_ros2_ws/install/mydog_policy/lib/mydog_policy
+Installing fanfan_ik_gait_node script to /home/jetson/mydog_ros2_ws/install/mydog_policy/lib/mydog_policy
+Installing fanfan_step_in_place_node script to /home/jetson/mydog_ros2_ws/install/mydog_policy/lib/mydog_policy
+Installing mydog_joint_semantic_test_node script to /home/jetson/mydog_ros2_ws/install/mydog_policy/lib/mydog_policy
+Installing mydog_openloop_gait_node script to /home/jetson/mydog_ros2_ws/install/mydog_policy/lib/mydog_policy
+Installing mydog_policy_node script to /home/jetson/mydog_ros2_ws/install/mydog_policy/lib/mydog_policy
+Installing mydog_soft_body_gait_node script to /home/jetson/mydog_ros2_ws/install/mydog_policy/lib/mydog_policy
+Installing mydog_state_estimator_node script to /home/jetson/mydog_ros2_ws/install/mydog_policy/lib/mydog_policy
+
+Installed /home/jetson/mydog_ros2_ws/build/mydog_policy
+running symlink_data
+creating /home/jetson/mydog_ros2_ws/install/mydog_policy/share/ament_index
+creating /home/jetson/mydog_ros2_ws/install/mydog_policy/share/ament_index/resource_index
+creating /home/jetson/mydog_ros2_ws/install/mydog_policy/share/ament_index/resource_index/packages
+symbolically linking /home/jetson/mydog_ros2_ws/build/mydog_policy/resource/mydog_policy -> /home/jetson/mydog_ros2_ws/install/mydog_policy/share/ament_index/resource_index/packages
+symbolically linking /home/jetson/mydog_ros2_ws/build/mydog_policy/package.xml -> /home/jetson/mydog_ros2_ws/install/mydog_policy/share/mydog_policy
+creating /home/jetson/mydog_ros2_ws/install/mydog_policy/share/mydog_policy/launch
+symbolically linking /home/jetson/mydog_ros2_ws/build/mydog_policy/launch/openloop_collect.launch.py -> /home/jetson/mydog_ros2_ws/install/mydog_policy/share/mydog_policy/launch
+symbolically linking /home/jetson/mydog_ros2_ws/build/mydog_policy/launch/fanfan_ik_gait.launch.py -> /home/jetson/mydog_ros2_ws/install/mydog_policy/share/mydog_policy/launch
+symbolically linking /home/jetson/mydog_ros2_ws/build/mydog_policy/launch/policy_walk.launch.py -> /home/jetson/mydog_ros2_ws/install/mydog_policy/share/mydog_policy/launch
+symbolically linking /home/jetson/mydog_ros2_ws/build/mydog_policy/launch/fanfan_step_in_place.launch.py -> /home/jetson/mydog_ros2_ws/install/mydog_policy/share/mydog_policy/launch
+symbolically linking /home/jetson/mydog_ros2_ws/build/mydog_policy/launch/soft_body_openloop.launch.py -> /home/jetson/mydog_ros2_ws/install/mydog_policy/share/mydog_policy/launch
