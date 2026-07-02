@@ -39,7 +39,7 @@ class JointSemanticMapper:
     同时，如果某些关节正负方向和训练不一致，需要修改 joint_sign。
     """
 
-    def __init__(self):
+    def __init__(self, policy_joint_names=None, default_joint_angles=None):
         # ============================================================
         # 1. 真机电机返回顺序
         #    必须和 motor_state_interface.py 里 q_real/dq_real 的顺序一致
@@ -194,21 +194,75 @@ class JointSemanticMapper:
         #
         # 注意：这个限幅只用于输出动作时保护，不参与 obs 拼接。
         # ============================================================
-        # URDF-derived safety limits in policy joint order. The calf upper
-        # limit is kept at 0.0 instead of the URDF's +0.35 for extra margin.
+        # Updated Fanfan training URDF limits in policy joint coordinates.
+        # Keep these aligned with fanfan_urdf/fanfan_urdf/urdf/fanfan.urdf.
         self.policy_lower_limit = np.array([
-            -0.6980, -1.5708, -2.4435,    # FR
-            -0.3140, -1.5708, -2.4435,    # FL
-            -0.6980, -0.6458, -2.4435,    # RR
-            -0.3140, -0.6458, -2.4435,    # RL
+            -0.8, -0.5, -2.7,    # FR
+            -0.8, -0.5, -2.7,    # FL
+            -0.8, -0.5, -2.7,    # RR
+            -0.8, -0.5, -2.7,    # RL
         ], dtype=np.float32)
 
         self.policy_upper_limit = np.array([
-            0.3140, 0.6458, 0.0,       # FR
-            0.6980, 0.6458, 0.0,       # FL
-            0.3140, 1.5708, 0.0,       # RR
-            0.6980, 1.5708, 0.0,       # RL
+            0.8, 4.0, -0.85,    # FR
+            0.8, 4.0, -0.85,    # FL
+            0.8, 4.0, -0.85,    # RR
+            0.8, 4.0, -0.85,    # RL
         ], dtype=np.float32)
+
+        if policy_joint_names is not None:
+            self.configure_policy_contract(policy_joint_names, default_joint_angles)
+
+    def configure_policy_contract(self, policy_joint_names, default_joint_angles=None):
+        """Reorder real/policy semantics to match an exported ONNX contract.
+
+        Motor signs, zero offsets and joint limits are properties of the real
+        robot, so they are looked up by joint name before changing the policy
+        order.  The training default pose may then be replaced by the values
+        embedded in the model.
+        """
+        names = list(policy_joint_names)
+        if len(names) != 12 or len(set(names)) != 12:
+            raise ValueError("policy_joint_names must contain 12 unique names")
+        unknown = sorted(set(names) - set(self.real_joint_names))
+        if unknown:
+            raise ValueError(f"ONNX contract contains unknown joints: {unknown}")
+
+        old_names = list(self.policy_joint_names)
+        by_name = {
+            name: (
+                float(self.joint_sign[i]),
+                float(self.real_zero_offset_policy_order[i]),
+                float(self.policy_lower_limit[i]),
+                float(self.policy_upper_limit[i]),
+                float(self.default_joint_angle[i]),
+            )
+            for i, name in enumerate(old_names)
+        }
+
+        self.policy_joint_names = names
+        self.policy_to_real_index = np.asarray(
+            [self.real_joint_names.index(name) for name in names], dtype=np.int64
+        )
+        self.joint_sign = np.asarray([by_name[name][0] for name in names], dtype=np.float32)
+        self.real_zero_offset_policy_order = np.asarray(
+            [by_name[name][1] for name in names], dtype=np.float32
+        )
+        self.policy_lower_limit = np.asarray(
+            [by_name[name][2] for name in names], dtype=np.float32
+        )
+        self.policy_upper_limit = np.asarray(
+            [by_name[name][3] for name in names], dtype=np.float32
+        )
+        if default_joint_angles is None:
+            self.default_joint_angle = np.asarray(
+                [by_name[name][4] for name in names], dtype=np.float32
+            )
+        else:
+            default = np.asarray(default_joint_angles, dtype=np.float32).reshape(-1)
+            if default.shape[0] != 12 or not np.all(np.isfinite(default)):
+                raise ValueError("default_joint_angles must contain 12 finite values")
+            self.default_joint_angle = default.copy()
 
     # ============================================================
     # 输入方向：真机电机 angle/speed -> 策略 obs
@@ -355,6 +409,20 @@ class JointSemanticMapper:
         target_real[self.policy_to_real_index] = target_real_policy_order
 
         return target_real.astype(np.float32)
+
+    def policy_values_to_real_order(self, values):
+        """Reorder per-joint values without applying angle signs or offsets.
+
+        Gains, torque limits and other magnitudes are indexed by joint name but
+        are not joint coordinates.  They only need policy-order -> motor-order
+        permutation; applying ``joint_sign`` to them would be incorrect.
+        """
+        policy_values = np.asarray(values, dtype=np.float32).reshape(-1)
+        if policy_values.shape[0] != 12 or not np.all(np.isfinite(policy_values)):
+            raise ValueError("policy values must contain 12 finite values")
+        real_values = np.zeros(12, dtype=np.float32)
+        real_values[self.policy_to_real_index] = policy_values
+        return real_values
 
     # ============================================================
     # 调试辅助

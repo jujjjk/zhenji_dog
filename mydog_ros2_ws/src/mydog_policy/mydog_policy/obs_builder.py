@@ -22,7 +22,8 @@ class ObsBuilder36:
         obs[12:24]  joint_pos = q_abs_policy - default_joint_angle
         obs[24:36]  joint_vel
         obs[36:48]  last_action, when obs_dim is 48 or 50
-        obs[48:50]  gait_phase = [sin(phase), cos(phase)], only when obs_dim is 50
+        obs[48:50]  gait_phase = [sin(phase), cos(phase)], when obs_dim >= 50
+        obs[50:52]  heading error = [sin(error), cos(error)], only at 52 dims
 
     base_lin_vel_source:
         command    legacy mode: obs[0:3] = [cmd_vx, cmd_vy, 0]
@@ -40,16 +41,20 @@ class ObsBuilder36:
         obs_dim=36,
         semantic_yaw_180=False,
         gait_phase_period=0.55,
+        deployment_config=None,
+        motor_state_async=True,
+        motor_state_poll_hz=50.0,
     ):
         self.obs_dim = int(obs_dim)
-        if self.obs_dim not in (36, 48, 50):
-            raise ValueError("obs_dim must be 36, 48, or 50")
+        if self.obs_dim not in (36, 48, 50, 52):
+            raise ValueError("obs_dim must be 36, 48, 50, or 52")
 
         self.semantic_yaw_180 = bool(semantic_yaw_180)
         self.gait_phase_period = float(gait_phase_period)
         if self.gait_phase_period <= 1e-6:
             raise ValueError("gait_phase_period must be positive")
         self.gait_phase_start_time = time.time()
+        self.last_gait_phase = 0.0
         self.base_lin_vel_source = str(base_lin_vel_source).lower()
         if self.base_lin_vel_source not in ("command", "zero", "estimator"):
             raise ValueError("base_lin_vel_source must be 'command', 'zero', or 'estimator'")
@@ -70,8 +75,26 @@ class ObsBuilder36:
             base_url=motor_base_url,
             timeout=0.08,
             stale_recheck_ms=max_motor_age_ms,
+            enable_stale_recheck=not bool(motor_state_async),
+            async_poll=bool(motor_state_async),
+            poll_hz=float(motor_state_poll_hz),
         )
         self.mapper = JointSemanticMapper()
+
+        self.lin_vel_scale = 1.0
+        self.ang_vel_scale = 1.0
+        self.dof_pos_scale = 1.0
+        self.dof_vel_scale = 1.0
+        self.command_scale = np.ones(3, dtype=np.float32)
+        self.obs_clip = float("inf")
+        self.heading_command = False
+        self.heading_gain = 0.5
+        self.heading_target = None
+        self.heading_yaw = None
+        self._heading_stamp = time.monotonic()
+        self.deployment_config = deployment_config
+        if deployment_config is not None:
+            self.configure_deployment(deployment_config)
 
         self.cmd = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.last_action = np.zeros(12, dtype=np.float32)
@@ -108,17 +131,62 @@ class ObsBuilder36:
         elif self.base_lin_vel_source == "zero":
             self.base_lin_vel[:] = [0.0, 0.0, 0.0]
 
+    def configure_deployment(self, config):
+        dimensions = config.get("dimensions", {})
+        if int(dimensions.get("observations", self.obs_dim)) != self.obs_dim:
+            raise ValueError("ONNX metadata observation dimension does not match the graph")
+        self.mapper.configure_policy_contract(
+            config["joint_names"], config["default_joint_angles"]
+        )
+        obs = config["observations"]
+        self.lin_vel_scale = float(obs["lin_vel_scale"])
+        self.ang_vel_scale = float(obs["ang_vel_scale"])
+        self.dof_pos_scale = float(obs["dof_pos_scale"])
+        self.dof_vel_scale = float(obs["dof_vel_scale"])
+        self.command_scale = np.asarray(obs["command_scale"], dtype=np.float32).reshape(3)
+        self.obs_clip = abs(float(obs["clip"]))
+        commands = config.get("commands", {})
+        self.heading_command = bool(commands.get("heading_command", False))
+        self.heading_gain = float(commands.get("heading_gain", 0.5))
+        self.gait_phase_period = float(config["gait"]["period"])
+        self.gait_phase_start_time = time.time()
+
     def set_last_action(self, action_12):
         action = np.asarray(action_12, dtype=np.float32).reshape(-1)
         if action.shape[0] < 12:
             raise ValueError(f"last_action must have at least 12 floats, got {action.shape[0]}")
         self.last_action[:] = action[:12]
 
-    def get_gait_phase_obs(self):
-        elapsed = time.time() - self.gait_phase_start_time
-        phase = (elapsed / self.gait_phase_period) % 1.0
+    def get_gait_phase_obs(self, phase=None):
+        if phase is None:
+            phase = self.get_gait_phase()
         angle = 2.0 * math.pi * phase
         return np.array([math.sin(angle), math.cos(angle)], dtype=np.float32)
+
+    def get_gait_phase(self):
+        phase = (
+            (time.time() - self.gait_phase_start_time) / self.gait_phase_period
+        ) % 1.0
+        self.last_gait_phase = float(phase)
+        return self.last_gait_phase
+
+    @staticmethod
+    def _wrap_pi(angle):
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+    def _get_heading_observation(self):
+        now = time.monotonic()
+        dt = min(max(now - self._heading_stamp, 0.0), 0.1)
+        self._heading_stamp = now
+        yaw = self.heading_yaw
+        if yaw is None:
+            return np.array([0.0, 1.0], dtype=np.float32), float(self.cmd[2])
+        if self.heading_target is None:
+            self.heading_target = yaw
+        self.heading_target = self._wrap_pi(self.heading_target + float(self.cmd[2]) * dt)
+        error = self._wrap_pi(self.heading_target - yaw)
+        yaw_command = float(np.clip(self.heading_gain * error, -1.0, 1.0))
+        return np.array([math.sin(error), math.cos(error)], dtype=np.float32), yaw_command
 
     def transform_policy_array_for_obs(self, arr_12):
         arr = np.asarray(arr_12, dtype=np.float32).reshape(12)
@@ -147,6 +215,7 @@ class ObsBuilder36:
             [0:3] base_lin_vel
             [3:6] base_ang_vel
             [6:9] projected_gravity
+            [9]   yaw in radians (optional for legacy publishers)
         """
         state = np.asarray(state_9, dtype=np.float32).reshape(-1)
         if state.shape[0] < 9:
@@ -157,6 +226,8 @@ class ObsBuilder36:
         self.base_lin_vel[:] = state[0:3]
         self.base_ang_vel[:] = state[3:6]
         self.projected_gravity[:] = state[6:9]
+        if state.shape[0] >= 10 and np.isfinite(state[9]):
+            self.heading_yaw = float(state[9])
         self.state_estimator_stamp = time.time()
         self.state_estimator_valid = True
 
@@ -182,7 +253,12 @@ class ObsBuilder36:
                 valid,
             )
 
-        base_ang_vel, projected_gravity, imu_valid = self.imu.get_policy_imu_obs()
+        imu = self.imu.get_latest()
+        base_ang_vel = imu.gyro_rad_s
+        projected_gravity = imu.projected_gravity
+        imu_valid = imu.valid
+        if imu_valid and np.isfinite(imu.rpy_deg[2]):
+            self.heading_yaw = math.radians(float(imu.rpy_deg[2]))
         return (
             self.base_lin_vel.copy(),
             np.asarray(base_ang_vel, dtype=np.float32).copy(),
@@ -210,16 +286,27 @@ class ObsBuilder36:
         dq_policy = self.transform_policy_array_for_obs(dq_policy)
 
         obs = np.zeros(self.obs_dim, dtype=np.float32)
-        obs[0:3] = base_lin_vel
-        obs[3:6] = base_ang_vel
+        heading_obs, policy_yaw_command = self._get_heading_observation()
+        gait_phase = self.get_gait_phase()
+        gait_phase_obs = self.get_gait_phase_obs(gait_phase)
+        policy_cmd = self.cmd.copy()
+        if self.heading_command:
+            policy_cmd[2] = policy_yaw_command
+
+        obs[0:3] = base_lin_vel * self.lin_vel_scale
+        obs[3:6] = base_ang_vel * self.ang_vel_scale
         obs[6:9] = projected_gravity
-        obs[9:12] = self.cmd
-        obs[12:24] = q_policy
-        obs[24:36] = dq_policy
+        obs[9:12] = policy_cmd * self.command_scale
+        obs[12:24] = q_policy * self.dof_pos_scale
+        obs[24:36] = dq_policy * self.dof_vel_scale
         if self.obs_dim >= 48:
             obs[36:48] = self.last_action
         if self.obs_dim >= 50:
-            obs[48:50] = self.get_gait_phase_obs()
+            obs[48:50] = gait_phase_obs
+        if self.obs_dim >= 52:
+            obs[50:52] = heading_obs
+
+        obs = np.clip(obs, -self.obs_clip, self.obs_clip).astype(np.float32)
 
         info = {
             "imu_valid": state_valid,
@@ -227,7 +314,7 @@ class ObsBuilder36:
             "base_lin_vel": base_lin_vel.copy(),
             "base_ang_vel": base_ang_vel.copy(),
             "projected_gravity": projected_gravity.copy(),
-            "cmd": self.cmd.copy(),
+            "cmd": policy_cmd.copy(),
             "q_real": q_real.copy(),
             "dq_real": dq_real.copy(),
             "torque_real": motor_snapshot.torque.copy(),
@@ -235,7 +322,8 @@ class ObsBuilder36:
             "q_policy": q_policy.copy(),
             "dq_policy": dq_policy.copy(),
             "last_action": self.last_action.copy(),
-            "gait_phase": self.get_gait_phase_obs(),
+            "gait_phase": gait_phase_obs.copy(),
+            "heading": heading_obs.copy(),
             "online": motor_snapshot.online.copy(),
             "error_code": motor_snapshot.error_code.copy(),
             "age_ms": motor_snapshot.age_ms.copy(),

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import time
 import numpy as np
 
 import rclpy
@@ -42,6 +43,10 @@ class MydogStateEstimatorNode(Node):
         self.motor = MotorStateHttpInterface(
             base_url=self.motor_base_url,
             timeout=0.08,
+            stale_recheck_ms=self.max_motor_age_ms,
+            enable_stale_recheck=False,
+            async_poll=True,
+            poll_hz=self.estimator_hz,
         )
         self.imu = ImuSerialInterface(
             port=self.imu_port,
@@ -54,6 +59,7 @@ class MydogStateEstimatorNode(Node):
             stance_speed_threshold=float(self.get_parameter("stance_speed_threshold").value),
             filter_alpha=float(self.get_parameter("filter_alpha").value),
         )
+        self._last_info_log_time = 0.0
 
         self.pub_base_lin_vel = self.create_publisher(
             Float32MultiArray,
@@ -128,6 +134,7 @@ class MydogStateEstimatorNode(Node):
                     result.base_lin_vel,
                     imu.gyro_rad_s.astype(np.float32),
                     imu.projected_gravity.astype(np.float32),
+                    np.array([np.deg2rad(imu.rpy_deg[2])], dtype=np.float32),
                 ]
             )
             self.publish_array(self.pub_state, state)
@@ -143,15 +150,18 @@ class MydogStateEstimatorNode(Node):
             )
             self.publish_array(self.pub_debug, debug)
 
-            self.get_logger().info(
-                "base_lin_vel="
-                f"{np.array2string(result.base_lin_vel, precision=3)} "
-                f"raw={np.array2string(result.raw_base_lin_vel, precision=3)} "
-                f"stance={result.stance_mask.astype(int).tolist()} "
-                f"height={np.array2string(result.foot_height, precision=3)} "
-                f"conf={result.confidence:.2f} "
-                f"max_age={max_age:.1f}ms"
-            )
+            now = time.monotonic()
+            if now - self._last_info_log_time >= 1.0:
+                self._last_info_log_time = now
+                self.get_logger().info(
+                    "base_lin_vel="
+                    f"{np.array2string(result.base_lin_vel, precision=3)} "
+                    f"raw={np.array2string(result.raw_base_lin_vel, precision=3)} "
+                    f"stance={result.stance_mask.astype(int).tolist()} "
+                    f"height={np.array2string(result.foot_height, precision=3)} "
+                    f"conf={result.confidence:.2f} "
+                    f"max_age={max_age:.1f}ms"
+                )
 
         except Exception as exc:
             self.get_logger().error(f"state estimator error: {exc}")
@@ -165,6 +175,10 @@ class MydogStateEstimatorNode(Node):
     def destroy_node(self):
         try:
             self.imu.stop()
+        except Exception:
+            pass
+        try:
+            self.motor.close()
         except Exception:
             pass
         super().destroy_node()

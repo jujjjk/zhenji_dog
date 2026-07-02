@@ -2,7 +2,11 @@
 # -*- coding: utf-8 -*-
 
 import csv
+import copy
+import json
 import os
+import queue
+import threading
 import time
 import numpy as np
 import onnxruntime as ort
@@ -54,6 +58,24 @@ class OnnxPolicyRunner:
         self.output_name = self.session.get_outputs()[0].name
         input_shape = self.session.get_inputs()[0].shape
         self.obs_dim = self._get_obs_dim(input_shape)
+        metadata = self.session.get_modelmeta().custom_metadata_map
+        raw_config = metadata.get("fanfan_deployment_config")
+        self.deployment_config = json.loads(raw_config) if raw_config else None
+        self.output_transform = "identity"
+        if self.deployment_config is not None:
+            if self.deployment_config.get("schema_version") != 1:
+                raise RuntimeError(
+                    "Unsupported fanfan_deployment_config schema: "
+                    f"{self.deployment_config.get('schema_version')}"
+                )
+            dimensions = self.deployment_config.get("dimensions", {})
+            if int(dimensions.get("observations", -1)) != self.obs_dim:
+                raise RuntimeError("ONNX graph and deployment metadata dimensions disagree")
+            if int(dimensions.get("actions", -1)) != 12:
+                raise RuntimeError("Fanfan deployment contract must contain 12 actions")
+            self.output_transform = str(
+                self.deployment_config["control"].get("output_transform", "identity")
+            ).lower()
 
         print("[ONNX] input :", self.input_name, self.session.get_inputs()[0].shape)
         print("[ONNX] output:", self.output_name, self.session.get_outputs()[0].shape)
@@ -72,8 +94,10 @@ class OnnxPolicyRunner:
             )
 
         dim = int(dim)
-        if dim not in (36, 48, 50):
-            raise RuntimeError(f"Unsupported ONNX obs dimension: {dim}, expected 36, 48, or 50")
+        if dim not in (36, 48, 50, 52):
+            raise RuntimeError(
+                f"Unsupported ONNX obs dimension: {dim}, expected 36, 48, 50, or 52"
+            )
         return dim
 
     def infer(self, obs_in: np.ndarray) -> np.ndarray:
@@ -89,7 +113,12 @@ class OnnxPolicyRunner:
         if action.shape[0] < 12:
             raise RuntimeError(f"ONNX output size < 12, got {action.shape}")
 
-        return action[:12].astype(np.float32)
+        action = action[:12]
+        if self.output_transform == "tanh":
+            action = np.tanh(action)
+        elif self.output_transform not in ("identity", "none"):
+            raise RuntimeError(f"Unsupported ONNX output transform: {self.output_transform}")
+        return action.astype(np.float32)
 
 
 class SafeTargetLimiter:
@@ -123,7 +152,12 @@ class SafeTargetLimiter:
         target_rate_mul = np.asarray(target_rate_mul, dtype=np.float32).reshape(12)
         target_accel_mul = np.asarray(target_accel_mul, dtype=np.float32).reshape(12)
         dt = max(float(dt), 1e-4)
-        kp = max(abs(float(kp)), 1e-6)
+        kp = np.asarray(kp, dtype=np.float32)
+        if kp.shape == ():
+            kp = np.full(12, abs(float(kp)), dtype=np.float32)
+        else:
+            kp = np.abs(kp.reshape(12))
+        kp = np.maximum(kp, 1e-6)
         torque_budget = max(0.0, float(torque_budget_nm))
         base_err_limit = torque_budget / kp
         err_limit_vec = (
@@ -286,16 +320,23 @@ class MydogPolicyNode(Node):
         self.declare_parameter("max_cmd_x_rate_mps2", 0.05)
         self.declare_parameter("max_cmd_y_rate_mps2", 0.05)
         self.declare_parameter("max_cmd_yaw_rate_rad_s2", 0.3)
+        self.declare_parameter("require_cmd_vel", True)
+        self.declare_parameter("cmd_vel_timeout_sec", 0.5)
         self.declare_parameter("base_lin_vel_source", "zero")
         self.declare_parameter("state_estimator_timeout_sec", 0.25)
         self.declare_parameter("max_motor_age_ms", 100.0)
         self.declare_parameter("recheck_stale_motor_once", True)
+        self.declare_parameter("motor_state_async", True)
+        self.declare_parameter("motor_state_poll_hz", 50.0)
         self.declare_parameter("enable_send", False)
         self.declare_parameter("print_only", False)
         self.declare_parameter("debug_print_arrays", False)
         self.declare_parameter("debug_print_period_sec", 0.5)
         self.declare_parameter("debug_csv_path", "")
         self.declare_parameter("debug_csv_period_sec", 0.0)
+        self.declare_parameter("debug_csv_async", True)
+        self.declare_parameter("debug_csv_queue_size", 128)
+        self.declare_parameter("debug_csv_flush_every_n", 20)
         self.declare_parameter("debug_warn_action_abs", 0.95)
         self.declare_parameter("debug_warn_error_rad", 0.5)
         self.declare_parameter("debug_critical_error_rad", 1.0)
@@ -314,13 +355,23 @@ class MydogPolicyNode(Node):
         # 启动前默认站立参数
         # ============================================================
         self.declare_parameter("startup_stand_first", False)
-        self.declare_parameter("startup_stand_kp", 40.0)
-        self.declare_parameter("startup_stand_kd", 5.0)
+        self.declare_parameter("startup_stand_kp", 12.0)
+        self.declare_parameter("startup_stand_kd", 2.0)
         self.declare_parameter("startup_stand_speed", 0.0)
         self.declare_parameter("startup_stand_torque", 0.0)
         self.declare_parameter("startup_stand_enable_first", True)
         self.declare_parameter("startup_stand_stop_first", False)
         self.declare_parameter("startup_stand_settle_sec", 1.5)
+        self.declare_parameter("startup_stand_hold_current_sec", 0.5)
+        self.declare_parameter("startup_stand_ramp_sec", 12.0)
+        self.declare_parameter("startup_stand_timeout_sec", 25.0)
+        self.declare_parameter("startup_stand_max_rate_hip", 0.12)
+        self.declare_parameter("startup_stand_max_rate_thigh", 0.15)
+        self.declare_parameter("startup_stand_max_rate_calf", 0.15)
+        self.declare_parameter("startup_stand_max_step_rad", 0.003)
+        self.declare_parameter("startup_stand_ready_error_rad", 0.08)
+        self.declare_parameter("startup_stand_stop_error_rad", 0.30)
+        self.declare_parameter("startup_stand_stop_torque_nm", 8.0)
         self.declare_parameter("enable_default_pose_check", True)
         self.declare_parameter("default_pose_check_sec", 2.0)
         self.declare_parameter("use_policy_default_as_stand_pose", True)
@@ -331,7 +382,10 @@ class MydogPolicyNode(Node):
         # ============================================================
         self.declare_parameter("max_target_delta", 0.80)
         self.declare_parameter("send_kp", 40.0)
-        self.declare_parameter("send_kd", 5.0)
+        self.declare_parameter("send_kd", 1.2)
+        self.declare_parameter("use_model_pd_gains", True)
+        self.declare_parameter("model_kp_scale", 1.0)
+        self.declare_parameter("model_kd_scale", 1.0)
         self.declare_parameter("send_speed", 0.0)
         self.declare_parameter("send_torque", 0.0)
         self.declare_parameter("enable_velocity_ff", False)
@@ -488,16 +542,29 @@ class MydogPolicyNode(Node):
         self.max_cmd_yaw_rate_rad_s2 = float(
             self.get_parameter("max_cmd_yaw_rate_rad_s2").value
         )
+        self.require_cmd_vel = bool(self.get_parameter("require_cmd_vel").value)
+        self.cmd_vel_timeout_sec = float(
+            self.get_parameter("cmd_vel_timeout_sec").value
+        )
         self.max_motor_age_ms = float(self.get_parameter("max_motor_age_ms").value)
         self.recheck_stale_motor_once = bool(
             self.get_parameter("recheck_stale_motor_once").value
         )
+        self.motor_state_async = bool(self.get_parameter("motor_state_async").value)
+        self.motor_state_poll_hz = float(self.get_parameter("motor_state_poll_hz").value)
         self.enable_send = bool(self.get_parameter("enable_send").value)
         self.print_only = bool(self.get_parameter("print_only").value)
         self.debug_print_arrays = bool(self.get_parameter("debug_print_arrays").value)
         self.debug_print_period_sec = float(self.get_parameter("debug_print_period_sec").value)
         self.debug_csv_path = str(self.get_parameter("debug_csv_path").value)
         self.debug_csv_period_sec = float(self.get_parameter("debug_csv_period_sec").value)
+        self.debug_csv_async = bool(self.get_parameter("debug_csv_async").value)
+        self.debug_csv_queue_size = max(
+            8, int(self.get_parameter("debug_csv_queue_size").value)
+        )
+        self.debug_csv_flush_every_n = max(
+            1, int(self.get_parameter("debug_csv_flush_every_n").value)
+        )
         self.debug_warn_action_abs = float(self.get_parameter("debug_warn_action_abs").value)
         self.debug_warn_error_rad = float(self.get_parameter("debug_warn_error_rad").value)
         self.debug_critical_error_rad = float(self.get_parameter("debug_critical_error_rad").value)
@@ -524,6 +591,32 @@ class MydogPolicyNode(Node):
         self.startup_stand_enable_first = bool(self.get_parameter("startup_stand_enable_first").value)
         self.startup_stand_stop_first = bool(self.get_parameter("startup_stand_stop_first").value)
         self.startup_stand_settle_sec = float(self.get_parameter("startup_stand_settle_sec").value)
+        self.startup_stand_hold_current_sec = float(
+            self.get_parameter("startup_stand_hold_current_sec").value
+        )
+        self.startup_stand_ramp_sec = float(
+            self.get_parameter("startup_stand_ramp_sec").value
+        )
+        self.startup_stand_timeout_sec = float(
+            self.get_parameter("startup_stand_timeout_sec").value
+        )
+        self.startup_stand_max_rate = self.make_joint_type_vector(
+            float(self.get_parameter("startup_stand_max_rate_hip").value),
+            float(self.get_parameter("startup_stand_max_rate_thigh").value),
+            float(self.get_parameter("startup_stand_max_rate_calf").value),
+        )
+        self.startup_stand_max_step_rad = float(
+            self.get_parameter("startup_stand_max_step_rad").value
+        )
+        self.startup_stand_ready_error_rad = float(
+            self.get_parameter("startup_stand_ready_error_rad").value
+        )
+        self.startup_stand_stop_error_rad = float(
+            self.get_parameter("startup_stand_stop_error_rad").value
+        )
+        self.startup_stand_stop_torque_nm = float(
+            self.get_parameter("startup_stand_stop_torque_nm").value
+        )
         self.enable_default_pose_check = bool(
             self.get_parameter("enable_default_pose_check").value
         )
@@ -543,6 +636,18 @@ class MydogPolicyNode(Node):
         self.max_target_delta = float(self.get_parameter("max_target_delta").value)
         self.send_kp = float(self.get_parameter("send_kp").value)
         self.send_kd = float(self.get_parameter("send_kd").value)
+        self.use_model_pd_gains = bool(
+            self.get_parameter("use_model_pd_gains").value
+        )
+        self.model_kp_scale = max(
+            0.0, float(self.get_parameter("model_kp_scale").value)
+        )
+        self.model_kd_scale = max(
+            0.0, float(self.get_parameter("model_kd_scale").value)
+        )
+        self.send_kp_real = np.full(12, abs(self.send_kp), dtype=np.float32)
+        self.send_kd_real = np.full(12, abs(self.send_kd), dtype=np.float32)
+        self.pd_gain_source = "scalar_fallback"
         self.send_speed = float(self.get_parameter("send_speed").value)
         self.send_torque = float(self.get_parameter("send_torque").value)
         self.enable_velocity_ff = bool(self.get_parameter("enable_velocity_ff").value)
@@ -597,7 +702,14 @@ class MydogPolicyNode(Node):
             self.calf_target_accel_mul,
         )
         self._last_cmd_log_time = 0.0
+        self._last_cmd_receive_time = 0.0
+        self._last_cmd_timeout_log_time = 0.0
         self._last_send_ok_log_time = 0.0
+        self._last_control_summary_log_time = 0.0
+        self._last_torque_limit_log_time = 0.0
+        self._loop_rate_window_start = time.perf_counter()
+        self._loop_rate_last_tick = None
+        self._loop_period_samples = []
         self._last_debug_print_time = 0.0
         self._last_debug_csv_time = 0.0
         self._smooth_target_real = None
@@ -606,17 +718,60 @@ class MydogPolicyNode(Node):
         self._warned_obs_dim_padding = False
         self._debug_csv_file = None
         self._debug_csv_writer = None
+        self._debug_csv_queue = queue.Queue(maxsize=self.debug_csv_queue_size)
+        self._debug_csv_stop = threading.Event()
+        self._debug_csv_thread = None
+        self._debug_csv_dropped = 0
+        self._debug_csv_rows_since_flush = 0
         self.safe_target_limiter = SafeTargetLimiter()
         self.deploy_cpg = None
         self._last_q_cpg_policy_abs = np.zeros(12, dtype=np.float32)
         self._last_delta_q_rl_policy = np.zeros(12, dtype=np.float32)
+        self._last_gait_offset_policy = np.zeros(12, dtype=np.float32)
         self._last_cpg_info = {}
         self._stand_mapper = JointSemanticMapper()
+        self.policy = None
+        self.deployment_config = None
+        if self.policy_enable and not self.stand_only and not self.joint_probe_enable:
+            self.get_logger().info(f"Loading ONNX policy: {self.onnx_path}")
+            self.policy = OnnxPolicyRunner(self.onnx_path)
+            self.deployment_config = self.policy.deployment_config
+            if self.deployment_config is not None:
+                self._stand_mapper.configure_policy_contract(
+                    self.deployment_config["joint_names"],
+                    self.deployment_config["default_joint_angles"],
+                )
+                control = self.deployment_config["control"]
+                self.configure_policy_pd_gains(control, self._stand_mapper)
+                exported_hz = 1.0 / (
+                    float(control["sim_dt"]) * int(control["decimation"])
+                )
+                if abs(self.policy_hz - exported_hz) > 1.0e-3:
+                    self.get_logger().warn(
+                        f"policy_hz={self.policy_hz:.3f} overridden by ONNX contract "
+                        f"({exported_hz:.3f} Hz)"
+                    )
+                self.policy_hz = exported_hz
+                self.gait_phase_period = float(self.deployment_config["gait"]["period"])
+                if self.action_mode != "pure_rl":
+                    self.get_logger().warn(
+                        f"action_mode={self.action_mode!r} overridden with pure_rl; "
+                        "the exported model already defines its gait reference"
+                    )
+                    self.action_mode = "pure_rl"
         self.http_session = requests.Session()
         self._mode_start_time = time.time()
         self._stand_only_done_logged = False
         self._joint_probe_last_state = None
         self._joint_probe_policy_index = None
+        self._startup_stand_state = "complete"
+        self._startup_stand_start_time = None
+        self._startup_stand_start_real = None
+        self._startup_stand_cmd_real = None
+        self._startup_stand_target_real = None
+        self._startup_stand_ready_since = None
+        self._startup_stand_last_log_time = 0.0
+        self._startup_stand_enable_sent = False
 
         if self.print_only:
             self.enable_send = False
@@ -633,12 +788,20 @@ class MydogPolicyNode(Node):
         # ============================================================
         # 可选：启动时先进入默认站立
         # ============================================================
-        startup_stand_requested = (
+        deferred_startup_stand = bool(
             self.startup_stand_first
-            or self.stand_only
-            or self.joint_probe_enable
+            and self.policy_enable
+            and not self.stand_only
+            and not self.joint_probe_enable
         )
-        if startup_stand_requested:
+        immediate_diagnostic_stand = bool(self.stand_only or self.joint_probe_enable)
+        if deferred_startup_stand:
+            self._startup_stand_state = "waiting_feedback"
+            self.print_stand_pose_source_comparison()
+            self.get_logger().warn(
+                "Startup stand will be ramped from live feedback before ONNX control."
+            )
+        elif immediate_diagnostic_stand:
             self.print_stand_pose_source_comparison()
             self.get_logger().warn(
                 "sending DEFAULT_STAND_POSE before control starts."
@@ -655,10 +818,7 @@ class MydogPolicyNode(Node):
         # ============================================================
         # ObsBuilder：IMU + 电机反馈 + 36维 obs
         # ============================================================
-        self.policy = None
-        if self.policy_enable and not self.stand_only and not self.joint_probe_enable:
-            self.get_logger().info(f"Loading ONNX policy: {self.onnx_path}")
-            self.policy = OnnxPolicyRunner(self.onnx_path)
+        if self.policy is not None:
             obs_dim = self.policy.obs_dim
         else:
             obs_dim = 50
@@ -680,11 +840,14 @@ class MydogPolicyNode(Node):
             obs_dim=obs_dim,
             semantic_yaw_180=self.semantic_yaw_180,
             gait_phase_period=self.gait_phase_period,
+            deployment_config=self.deployment_config,
+            motor_state_async=self.motor_state_async,
+            motor_state_poll_hz=self.motor_state_poll_hz,
         )
         self.obs_builder.start()
         self.obs_builder.set_command(0.0, 0.0, 0.0)
         self.deploy_cpg = self.create_deploy_cpg()
-        if startup_stand_requested and self.enable_default_pose_check:
+        if immediate_diagnostic_stand and self.enable_default_pose_check:
             self.run_default_pose_check()
         self.setup_debug_csv()
 
@@ -785,6 +948,11 @@ class MydogPolicyNode(Node):
             f"accel_mul={self.hip_target_accel_mul:.2f}/"
             f"{self.thigh_target_accel_mul:.2f}/"
             f"{self.calf_target_accel_mul:.2f}, "
+            f"pd_gain_source={self.pd_gain_source}, "
+            f"model_kp/kd_scale={self.model_kp_scale:.2f}/"
+            f"{self.model_kd_scale:.2f}, "
+            f"kp_real={self.send_kp_real.tolist()}, "
+            f"kd_real={self.send_kd_real.tolist()}, "
             f"torque_limit_nm={self.motor_torque_limit_nm:.2f}, "
             f"torque_safety_ratio={self.torque_safety_ratio:.2f}, "
             f"torque_safety_budget_nm={self.torque_safety_budget_nm:.2f}, "
@@ -799,6 +967,9 @@ class MydogPolicyNode(Node):
         )
 
     def cmd_callback(self, msg: Twist):
+        now = time.time()
+        was_stale = not self.command_is_fresh(now)
+        self._last_cmd_receive_time = now
         self.cmd_target[:] = [
             float(msg.linear.x),
             float(msg.linear.y),
@@ -809,13 +980,25 @@ class MydogPolicyNode(Node):
             self.cmd[:] = self.cmd_target
             self.obs_builder.set_command(self.cmd[0], self.cmd[1], self.cmd[2])
 
-        now = time.time()
+        if was_stale and hasattr(self, "obs_builder"):
+            self.obs_builder.gait_phase_start_time = now
+            self.obs_builder.last_gait_phase = 0.0
+            self.obs_builder.set_last_action(np.zeros(12, dtype=np.float32))
         if now - self._last_cmd_log_time > 1.0:
             self._last_cmd_log_time = now
             self.get_logger().info(
                 f"[CMD] received /cmd_vel target={self.cmd_target.tolist()} "
                 f"smoothed={self.cmd.tolist()}"
             )
+
+    def command_is_fresh(self, now=None):
+        if not self.require_cmd_vel:
+            return True
+        now = time.time() if now is None else float(now)
+        return (
+            self._last_cmd_receive_time > 0.0
+            and now - self._last_cmd_receive_time <= self.cmd_vel_timeout_sec
+        )
 
     @staticmethod
     def make_joint_type_vector(hip_value, thigh_value, calf_value):
@@ -838,6 +1021,43 @@ class MydogPolicyNode(Node):
                 f"got {value!r}"
             )
         return signs.astype(np.float32)
+
+    def configure_policy_pd_gains(self, control: dict, mapper: JointSemanticMapper):
+        """Load per-joint PD gains from the ONNX contract in motor order."""
+        if not self.use_model_pd_gains:
+            self.pd_gain_source = "scalar_override"
+            return
+
+        try:
+            kp_policy = np.asarray(control["stiffness"], dtype=np.float32).reshape(-1)
+            kd_policy = np.asarray(control["damping"], dtype=np.float32).reshape(-1)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "ONNX deployment contract must provide 12-element stiffness/damping"
+            ) from exc
+
+        if (
+            kp_policy.shape[0] != 12
+            or kd_policy.shape[0] != 12
+            or not np.all(np.isfinite(kp_policy))
+            or not np.all(np.isfinite(kd_policy))
+            or np.any(kp_policy <= 0.0)
+            or np.any(kd_policy < 0.0)
+        ):
+            raise RuntimeError(
+                "ONNX stiffness must be 12 positive finite values and damping "
+                "must be 12 non-negative finite values"
+            )
+
+        self.send_kp_real = (
+            mapper.policy_values_to_real_order(kp_policy) * self.model_kp_scale
+        ).astype(np.float32)
+        self.send_kd_real = (
+            mapper.policy_values_to_real_order(kd_policy) * self.model_kd_scale
+        ).astype(np.float32)
+        if np.any(self.send_kp_real <= 0.0):
+            raise RuntimeError("model_kp_scale must keep all effective Kp values positive")
+        self.pd_gain_source = "onnx_contract"
 
     def compute_torque_safety_budget_nm(self):
         if self.torque_safety_budget_nm >= 0.0:
@@ -899,18 +1119,57 @@ class MydogPolicyNode(Node):
     def action_to_policy_target_abs(self, action_policy: np.ndarray) -> np.ndarray:
         mapper = self.obs_builder.mapper
         action_policy = np.asarray(action_policy, dtype=np.float32).reshape(12)
-        action_scale = np.asarray(self.action_scale, dtype=np.float32)
+        if self.deployment_config is not None:
+            action_scale = np.asarray(
+                self.deployment_config["control"]["action_scale"], dtype=np.float32
+            )
+        else:
+            action_scale = np.asarray(self.action_scale, dtype=np.float32)
         if action_scale.shape == ():
             action_scale = np.full(12, float(action_scale), dtype=np.float32)
         else:
             action_scale = action_scale.reshape(12)
 
         target_policy_abs = mapper.default_joint_angle + action_scale * action_policy
+        gait_offset = np.zeros(12, dtype=np.float32)
+        if self.deployment_config is not None:
+            gait_offset = self.deployment_gait_offset(
+                self.obs_builder.last_gait_phase
+            )
+            target_policy_abs += gait_offset
+        self._last_gait_offset_policy = np.asarray(gait_offset, dtype=np.float32).reshape(12).copy()
         return np.clip(
             target_policy_abs,
             mapper.policy_lower_limit,
             mapper.policy_upper_limit,
         ).astype(np.float32)
+
+    def deployment_gait_offset(self, phase: float) -> np.ndarray:
+        """Reproduce the gait reference used by training and sim2sim."""
+        if self.deployment_config is None:
+            return np.zeros(12, dtype=np.float32)
+        gait = self.deployment_config["gait"]
+        stance_ratio = float(gait["stance_ratio"])
+        offsets = gait["phase_offsets"]
+        result = np.zeros(12, dtype=np.float32)
+        for i, name in enumerate(self.deployment_config["joint_names"]):
+            leg = name[:2]
+            leg_phase = (float(phase) + float(offsets[leg])) % 1.0
+            swing = np.clip(
+                (leg_phase - stance_ratio) / (1.0 - stance_ratio), 0.0, 1.0
+            )
+            smooth = swing * swing * (3.0 - 2.0 * swing)
+            if "thigh" in name:
+                if leg_phase < stance_ratio:
+                    profile = -1.0 + 2.0 * np.clip(
+                        leg_phase / stance_ratio, 0.0, 1.0
+                    )
+                else:
+                    profile = 1.0 - 2.0 * smooth
+                result[i] = float(gait["thigh_amplitude"]) * profile
+            elif "calf" in name and leg_phase >= stance_ratio:
+                result[i] = float(gait["calf_amplitude"]) * np.sin(np.pi * smooth)
+        return result
 
     def action_to_policy_target_abs_by_mode(
         self,
@@ -966,6 +1225,13 @@ class MydogPolicyNode(Node):
             **cpg_info,
         }
 
+    @staticmethod
+    def leg_prefix_from_joint_name(joint_name: str) -> str:
+        name = str(joint_name)
+        if name.endswith("_joint"):
+            name = name[:-6]
+        return name.split("_", 1)[0]
+
     def apply_rear_leg_posture_bias(
         self,
         target_policy_abs: np.ndarray,
@@ -976,11 +1242,15 @@ class MydogPolicyNode(Node):
         if self.enable_rear_leg_posture_bias:
             thigh_bias = float(self.rear_thigh_bias_policy_rad)
             calf_bias = float(self.rear_calf_extend_bias_policy_rad)
-            # Policy order is FR, FL, RR, RL.
-            bias_vec[7] = thigh_bias
-            bias_vec[8] = calf_bias
-            bias_vec[10] = thigh_bias
-            bias_vec[11] = calf_bias
+            mapper = self.obs_builder.mapper
+            for i, name in enumerate(mapper.policy_joint_names):
+                leg = self.leg_prefix_from_joint_name(name)
+                if leg not in ("RL", "RR"):
+                    continue
+                if "thigh" in name:
+                    bias_vec[i] = thigh_bias
+                elif "calf" in name:
+                    bias_vec[i] = calf_bias
             target = target + bias_vec
             mapper = self.obs_builder.mapper
             target = np.clip(
@@ -1094,7 +1364,8 @@ class MydogPolicyNode(Node):
         real_to_policy_index[mapper.policy_to_real_index] = np.arange(12, dtype=np.int64)
 
         self.get_logger().warn(
-            "[DEFAULT_POSE_ALIGNMENT] policy order = FR, FL, RR, RL"
+            "[DEFAULT_POSE_ALIGNMENT] policy order = "
+            f"{mapper.get_policy_joint_names()}"
         )
         for policy_i, policy_name in enumerate(mapper.policy_joint_names):
             real_i = int(mapper.policy_to_real_index[policy_i])
@@ -1241,7 +1512,228 @@ class MydogPolicyNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Invalid /mydog/state_estimator message: {e}")
 
+    @staticmethod
+    def smootherstep01(value):
+        x = float(np.clip(value, 0.0, 1.0))
+        return x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
+
+    def handle_startup_stand(self, obs, info: dict, dt: float, max_age: float):
+        """Move from live motor feedback to the ONNX default before inference."""
+        now = time.time()
+        current = np.asarray(info["q_real"], dtype=np.float32).reshape(12)
+        current_dq = np.asarray(info["dq_real"], dtype=np.float32).reshape(12)
+        torque = np.asarray(info.get("torque_real", np.zeros(12)), dtype=np.float32)
+
+        if self._startup_stand_state == "fault":
+            return
+
+        if self._startup_stand_state == "waiting_feedback":
+            self._startup_stand_start_time = now
+            self._startup_stand_start_real = current.copy()
+            self._startup_stand_cmd_real = current.copy()
+            self._startup_stand_target_real = self.default_stand_target_real_order()
+            self._startup_stand_ready_since = None
+            self._startup_stand_state = "hold_current"
+            max_delta = float(
+                np.max(np.abs(self._startup_stand_target_real - current))
+            )
+            self.get_logger().warn(
+                "[STARTUP_STAND] captured live pose; ONNX inference is locked | "
+                f"max_transition={max_delta:.3f}rad "
+                f"hold={self.startup_stand_hold_current_sec:.1f}s "
+                f"ramp={self.startup_stand_ramp_sec:.1f}s "
+                f"send={self.enable_send}"
+            )
+
+        elapsed = now - self._startup_stand_start_time
+        if elapsed > self.startup_stand_timeout_sec:
+            self._startup_stand_state = "fault"
+            self.get_logger().error(
+                "[STARTUP_STAND][FAULT] timeout before reaching ONNX default; "
+                "motor targets stopped. Keep support engaged."
+            )
+            return
+
+        hold = max(0.0, self.startup_stand_hold_current_sec)
+        ramp = max(0.1, self.startup_stand_ramp_sec)
+        if elapsed <= hold:
+            desired = self._startup_stand_start_real.copy()
+            alpha = 0.0
+            stage = "hold_current"
+        else:
+            alpha = self.smootherstep01((elapsed - hold) / ramp)
+            desired = (
+                self._startup_stand_start_real
+                + alpha
+                * (self._startup_stand_target_real - self._startup_stand_start_real)
+            ).astype(np.float32)
+            stage = "ramp" if alpha < 1.0 else "settle"
+
+        max_step = np.maximum(self.startup_stand_max_rate, 0.0) * max(dt, 1.0e-4)
+        if self.startup_stand_max_step_rad > 0.0:
+            max_step = np.minimum(max_step, self.startup_stand_max_step_rad)
+        step = np.clip(
+            desired - self._startup_stand_cmd_real,
+            -max_step,
+            max_step,
+        )
+        self._startup_stand_cmd_real = (
+            self._startup_stand_cmd_real + step
+        ).astype(np.float32)
+
+        # Keep the low-gain transition inside the same real-motor torque
+        # budget used by policy control: |Kp*e - Kd*dq| <= budget.
+        torque_budget = self.compute_torque_safety_budget_nm()
+        kd_load = abs(self.startup_stand_kd) * np.abs(current_dq)
+        available = np.maximum(0.0, torque_budget - kd_load)
+        position_error_limit = available / max(abs(self.startup_stand_kp), 1.0e-6)
+        self._startup_stand_cmd_real = (
+            current
+            + np.clip(
+                self._startup_stand_cmd_real - current,
+                -position_error_limit,
+                position_error_limit,
+            )
+        ).astype(np.float32)
+
+        tracking_error = self._startup_stand_cmd_real - current
+        tracking_error_max = float(np.max(np.abs(tracking_error)))
+        torque_abs_max = float(np.max(np.abs(torque)))
+        target_error_max = float(
+            np.max(np.abs(self._startup_stand_target_real - current))
+        )
+
+        if tracking_error_max > self.startup_stand_stop_error_rad:
+            self._startup_stand_state = "fault"
+            self.get_logger().error(
+                "[STARTUP_STAND][FAULT] feedback stopped following ramp | "
+                f"tracking_error={tracking_error_max:.3f}rad > "
+                f"{self.startup_stand_stop_error_rad:.3f}rad"
+            )
+            return
+        if torque_abs_max > self.startup_stand_stop_torque_nm:
+            self._startup_stand_state = "fault"
+            self.get_logger().error(
+                "[STARTUP_STAND][FAULT] measured torque too high | "
+                f"max={torque_abs_max:.2f}Nm > "
+                f"{self.startup_stand_stop_torque_nm:.2f}Nm"
+            )
+            return
+
+        self.publish_array(self.pub_target, self._startup_stand_cmd_real)
+        sent = False
+        if self.enable_send:
+            sent = self.send_startup_stand_target(self._startup_stand_cmd_real)
+
+        ramp_finished = elapsed >= hold + ramp
+        ready = target_error_max <= self.startup_stand_ready_error_rad
+        if ramp_finished and ready:
+            if self._startup_stand_ready_since is None:
+                self._startup_stand_ready_since = now
+            elif now - self._startup_stand_ready_since >= self.startup_stand_settle_sec:
+                self.finish_startup_stand(current)
+                return
+        else:
+            self._startup_stand_ready_since = None
+
+        if now - self._startup_stand_last_log_time >= 1.0:
+            self._startup_stand_last_log_time = now
+            self.get_logger().info(
+                f"[STARTUP_STAND] stage={stage} alpha={alpha:.3f} "
+                f"target_error={target_error_max:.3f}rad "
+                f"tracking_error={tracking_error_max:.3f}rad "
+                f"torque_max={torque_abs_max:.2f}Nm age={max_age:.1f}ms "
+                f"sent={sent}"
+            )
+
+        current = np.asarray(info["q_real"], dtype=np.float32).reshape(12)
+        zeros = np.zeros(12, dtype=np.float32)
+        self.maybe_write_policy_csv(
+            obs=obs,
+            action_raw=zeros,
+            action_policy_obs=zeros,
+            action=zeros,
+            q_des=self._startup_stand_cmd_real,
+            current_q=current,
+            current_dq=current_dq,
+            error=self._startup_stand_cmd_real - current,
+            max_age=max_age,
+            measured_torque=info.get("torque_real"),
+            motor_temp=info.get("temp_real"),
+            motor_online=info.get("online"),
+            motor_error_code=info.get("error_code"),
+            motor_age_ms=info.get("age_ms"),
+            q_raw_des=self._startup_stand_cmd_real,
+            q_smooth_des=self._startup_stand_cmd_real,
+            motor_vel_cmd=zeros,
+            mode="startup_stand",
+        )
+
+    def finish_startup_stand(self, current_real):
+        now = time.time()
+        current = np.asarray(current_real, dtype=np.float32).reshape(12)
+        self._startup_stand_state = "complete"
+        self._last_cmd_receive_time = 0.0
+        self.cmd[:] = 0.0
+        self.cmd_target[:] = 0.0
+        self.obs_builder.set_command(0.0, 0.0, 0.0)
+        self.obs_builder.set_last_action(np.zeros(12, dtype=np.float32))
+        self.obs_builder.gait_phase_start_time = now
+        self.obs_builder.last_gait_phase = 0.0
+        self.safe_target_limiter.reset(current)
+        self._smooth_target_real = current.copy()
+        self._last_control_time = None
+        self.get_logger().warn(
+            "[STARTUP_STAND][READY] ONNX default pose is stable. "
+            "Publish a fresh /cmd_vel to hand control to ONNX."
+        )
+
+    def send_startup_stand_target(self, target_real):
+        target = np.asarray(target_real, dtype=np.float32).reshape(12)
+        if not np.all(np.isfinite(target)):
+            return False
+        items = []
+        for mid, position in zip(
+            self.obs_builder.mapper.get_real_motor_ids(), target
+        ):
+            items.append({
+                "motor_id": int(mid),
+                "position": float(position),
+                "speed": float(self.startup_stand_speed),
+                "torque": float(self.startup_stand_torque),
+                "kp": float(self.startup_stand_kp),
+                "kd": float(self.startup_stand_kd),
+            })
+        payload = {
+            "items": items,
+            "enable_first": bool(
+                self.startup_stand_enable_first
+                and not self._startup_stand_enable_sent
+            ),
+            "stop_first": bool(
+                self.startup_stand_stop_first
+                and not self._startup_stand_enable_sent
+            ),
+        }
+        try:
+            response = self.http_session.post(
+                f"{self.motor_base_url}/api/rs04/motion_batch_fast",
+                json=payload,
+                timeout=self.http_timeout,
+            )
+            if response.status_code != 200:
+                self.get_logger().warn(
+                    f"[STARTUP_STAND] HTTP {response.status_code}: {response.text}"
+                )
+                return False
+            self._startup_stand_enable_sent = True
+            return True
+        except Exception as exc:
+            self.get_logger().warn(f"[STARTUP_STAND] send failed: {exc}")
+            return False
+
     def control_loop(self):
+        self._record_control_loop_rate()
         try:
             dt = self.get_control_dt()
             self.update_smoothed_command(dt)
@@ -1286,6 +1778,10 @@ class MydogPolicyNode(Node):
 
             if self.require_online and not np.all(info["online"]):
                 self.get_logger().warn("[SAFE] Some motors offline. Skip policy.")
+                return
+
+            if self._startup_stand_state != "complete":
+                self.handle_startup_stand(obs, info, dt, max_age)
                 return
 
             if self.stand_only:
@@ -1335,7 +1831,7 @@ class MydogPolicyNode(Node):
                     q_raw=target_raw_real,
                     q_current=current_q,
                     dt=dt,
-                    kp=self.send_kp,
+                    kp=self.send_kp_real,
                     torque_budget_nm=torque_budget_nm,
                     err_limit_safety_factor=self.err_limit_safety_factor,
                     max_target_rate_rad_s=self.max_target_rate_rad_s,
@@ -1444,7 +1940,7 @@ class MydogPolicyNode(Node):
                 f"tau_est_max={torque_limit_info.get('tau_est_max', 0.0):.2f} "
                 f"final_limited={torque_limit_info.get('limited_count', 0)} "
                 f"send={self.enable_send}"
-            )
+            ) if self._control_summary_log_due() else None
 
             self.maybe_print_policy_debug(
                 action_raw=action_raw,
@@ -1458,13 +1954,48 @@ class MydogPolicyNode(Node):
                 rear_bias_info=rear_bias_info,
             )
 
-            if self.enable_send:
+            if self.enable_send and self.command_is_fresh():
                 self.send_motion_batch(target_real, info, motor_vel_cmd=motor_vel_cmd)
+            elif self.enable_send:
+                now = time.time()
+                if now - self._last_cmd_timeout_log_time >= 1.0:
+                    self._last_cmd_timeout_log_time = now
+                    self.get_logger().warn(
+                        "[SAFE] /cmd_vel missing or stale; policy target is not sent"
+                    )
 
             self.obs_builder.set_last_action(action_for_obs)
 
         except Exception as e:
             self.get_logger().error(f"policy loop error: {e}")
+
+    def _record_control_loop_rate(self):
+        now = time.perf_counter()
+        if self._loop_rate_last_tick is not None:
+            self._loop_period_samples.append(now - self._loop_rate_last_tick)
+        self._loop_rate_last_tick = now
+
+        elapsed = now - self._loop_rate_window_start
+        if elapsed < 2.0 or not self._loop_period_samples:
+            return
+        periods = np.asarray(self._loop_period_samples, dtype=np.float64)
+        self.get_logger().info(
+            f"[LOOP_RATE] hz={1.0 / float(np.mean(periods)):.2f} "
+            f"period_med={float(np.median(periods)) * 1000.0:.2f}ms "
+            f"p95={float(np.percentile(periods, 95)) * 1000.0:.2f}ms "
+            f"max={float(np.max(periods)) * 1000.0:.2f}ms "
+            f"csv_queue={self._debug_csv_queue.qsize()} "
+            f"csv_dropped={self._debug_csv_dropped}"
+        )
+        self._loop_period_samples.clear()
+        self._loop_rate_window_start = now
+
+    def _control_summary_log_due(self) -> bool:
+        now = time.monotonic()
+        if now - self._last_control_summary_log_time < 1.0:
+            return False
+        self._last_control_summary_log_time = now
+        return True
 
     def handle_stand_only(self, obs, info, max_age, mode="stand_only"):
         elapsed = time.time() - self._mode_start_time
@@ -1664,8 +2195,8 @@ class MydogPolicyNode(Node):
         q_real = np.asarray(q_real, dtype=np.float32).reshape(12)
         dq_real = np.asarray(dq_real, dtype=np.float32).reshape(12)
 
-        kp = abs(float(self.send_kp))
-        kd = abs(float(self.send_kd))
+        kp = np.abs(np.asarray(self.send_kp_real, dtype=np.float32).reshape(12))
+        kd = np.abs(np.asarray(self.send_kd_real, dtype=np.float32).reshape(12))
         if qd_target is None:
             qd_target = np.full(12, float(self.send_speed), dtype=np.float32)
         else:
@@ -1679,7 +2210,7 @@ class MydogPolicyNode(Node):
         vel_error = qd_target - dq_real
         kd_torque = kd * np.abs(vel_error)
 
-        if not self.enable_torque_error_limit or kp <= 1e-6:
+        if not self.enable_torque_error_limit or np.all(kp <= 1e-6):
             delta = target_real - q_real
             tau_est = kp * np.abs(delta) + kd_torque + feedforward_torque
             return target_real, {
@@ -1697,7 +2228,7 @@ class MydogPolicyNode(Node):
             }
 
         available_for_position = np.maximum(0.0, torque_budget - kd_torque)
-        err_limit = available_for_position / kp
+        err_limit = available_for_position / np.maximum(kp, 1e-6)
 
         raw_delta = target_real - q_real
         safe_delta = np.clip(raw_delta, -err_limit, err_limit)
@@ -1707,7 +2238,9 @@ class MydogPolicyNode(Node):
         limited_mask = np.abs(raw_delta - safe_delta) > 1e-6
         limited_count = int(np.count_nonzero(limited_mask))
 
-        if limited_count > 0:
+        now = time.monotonic()
+        if limited_count > 0 and now - self._last_torque_limit_log_time >= 1.0:
+            self._last_torque_limit_log_time = now
             self.get_logger().warn(
                 "[SAFE] torque error limit active: "
                 f"limited={limited_count}/12 "
@@ -1825,8 +2358,8 @@ class MydogPolicyNode(Node):
                 "position": float(target_real[i]),
                 "speed": float(motor_vel_cmd[i]),
                 "torque": float(self.send_torque),
-                "kp": float(self.send_kp),
-                "kd": float(self.send_kd),
+                "kp": float(self.send_kp_real[i]),
+                "kd": float(self.send_kd_real[i]),
             })
 
         payload = {
@@ -1862,7 +2395,8 @@ class MydogPolicyNode(Node):
                     f"[SEND] motion batch ok | "
                     f"max_delta={max_delta:.3f} | "
                     f"{vel_log}"
-                    f"kp={self.send_kp:.2f} kd={self.send_kd:.2f}"
+                    f"kp={self.send_kp_real.tolist()} "
+                    f"kd={self.send_kd_real.tolist()}"
                 )
             return True
 
@@ -1975,6 +2509,9 @@ class MydogPolicyNode(Node):
                 "q_current_minus_default_policy",
                 "q_raw_target_minus_default_policy",
                 "q_final_target_minus_default_policy",
+                "gait_ref_policy",
+                "rl_action_contrib_policy",
+                "global_gait_phase",
                 "raw_to_smooth_delta_real",
                 "smooth_to_final_delta_real",
                 "raw_to_final_delta_real",
@@ -2017,7 +2554,69 @@ class MydogPolicyNode(Node):
         self._debug_csv_file.flush()
         self.get_logger().warn(f"[DEBUG_CSV] writing joint debug log to {path}")
 
-    def maybe_write_policy_csv(
+        if self.debug_csv_async:
+            self._debug_csv_stop.clear()
+            self._debug_csv_thread = threading.Thread(
+                target=self._debug_csv_worker,
+                name="policy-debug-csv",
+                daemon=True,
+            )
+            self._debug_csv_thread.start()
+            self.get_logger().info(
+                f"[DEBUG_CSV] async writer enabled queue={self.debug_csv_queue_size}"
+            )
+
+    def _debug_csv_worker(self):
+        while not self._debug_csv_stop.is_set() or not self._debug_csv_queue.empty():
+            try:
+                args, kwargs = self._debug_csv_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._write_policy_csv_sync(*args, **kwargs)
+            except Exception as exc:
+                self.get_logger().error(f"[DEBUG_CSV] async write failed: {exc}")
+                self._debug_csv_stop.set()
+                break
+            finally:
+                self._debug_csv_queue.task_done()
+
+    def _stop_debug_csv_worker(self):
+        self._debug_csv_stop.set()
+        thread = self._debug_csv_thread
+        if thread is not None:
+            thread.join(timeout=5.0)
+            if thread.is_alive():
+                self.get_logger().error("[DEBUG_CSV] writer did not stop within 5 seconds")
+        self._debug_csv_thread = None
+
+    def maybe_write_policy_csv(self, *args, **kwargs):
+        if self._debug_csv_writer is None:
+            return
+
+        now = time.time()
+        if self.debug_csv_period_sec > 0.0:
+            if now - self._last_debug_csv_time < self.debug_csv_period_sec:
+                return
+        self._last_debug_csv_time = now
+
+        if not self.debug_csv_async:
+            self._write_policy_csv_sync(*args, record_time=now, **kwargs)
+            return
+        if self._debug_csv_stop.is_set():
+            return
+
+        # Control-loop values are small (mostly 12-element arrays). Copy them
+        # before returning so the writer thread sees a consistent cycle.
+        queued_kwargs = dict(kwargs)
+        queued_kwargs["record_time"] = now
+        record = copy.deepcopy((args, queued_kwargs))
+        try:
+            self._debug_csv_queue.put_nowait(record)
+        except queue.Full:
+            self._debug_csv_dropped += 1
+
+    def _write_policy_csv_sync(
         self,
         obs: np.ndarray,
         action_raw: np.ndarray,
@@ -2043,15 +2642,12 @@ class MydogPolicyNode(Node):
         mode: str = "policy",
         joint_probe_delta_rad: float = 0.0,
         joint_probe_name: str = "",
+        record_time: float = None,
     ):
         if self._debug_csv_writer is None:
             return
 
-        now = time.time()
-        if self.debug_csv_period_sec > 0.0:
-            if now - self._last_debug_csv_time < self.debug_csv_period_sec:
-                return
-        self._last_debug_csv_time = now
+        now = time.time() if record_time is None else float(record_time)
 
         obs = np.asarray(obs, dtype=np.float32).reshape(-1)
         action_raw = np.asarray(action_raw, dtype=np.float32).reshape(12)
@@ -2261,6 +2857,20 @@ class MydogPolicyNode(Node):
         ).reshape(-1)
         hip_gate_clamp_count = int(cpg_action_info.get("hip_gate_clamp_count", 0))
 
+        if self.deployment_config is not None:
+            action_scale_arr = np.asarray(
+                self.deployment_config["control"]["action_scale"], dtype=np.float32
+            ).reshape(12)
+        else:
+            action_scale_arr = np.full(12, float(self.action_scale), dtype=np.float32)
+        if mode == "startup_stand":
+            csv_kp_real = np.full(12, abs(self.startup_stand_kp), dtype=np.float32)
+            csv_kd_real = np.full(12, abs(self.startup_stand_kd), dtype=np.float32)
+        else:
+            csv_kp_real = self.send_kp_real
+            csv_kd_real = self.send_kd_real
+        global_gait_phase = float(self.obs_builder.last_gait_phase)
+
         for i, (mid, name) in enumerate(zip(motor_ids, real_names)):
             policy_i = int(real_to_policy_index[i])
             policy_name = policy_names[policy_i]
@@ -2298,8 +2908,8 @@ class MydogPolicyNode(Node):
                     f"{float(err_limit[i]):.6f}",
                     f"{float(tau_est[i]):.6f}",
                     int(torque_limited[i]),
-                    f"{self.send_kp:.6f}",
-                    f"{self.send_kd:.6f}",
+                    f"{float(csv_kp_real[i]):.6f}",
+                    f"{float(csv_kd_real[i]):.6f}",
                     f"{float(max_age):.3f}",
                     self.base_lin_vel_source,
                     int(self.semantic_yaw_180),
@@ -2356,6 +2966,9 @@ class MydogPolicyNode(Node):
                     f"{float(q_current_policy_abs[policy_i] - mapper.default_joint_angle[policy_i]):.6f}",
                     f"{float(q_raw_policy_abs[policy_i] - mapper.default_joint_angle[policy_i]):.6f}",
                     f"{float(q_final_policy_abs[policy_i] - mapper.default_joint_angle[policy_i]):.6f}",
+                    f"{float(self._last_gait_offset_policy[policy_i]):.6f}",
+                    f"{float(action[policy_i] * action_scale_arr[policy_i]):.6f}",
+                    f"{global_gait_phase:.6f}",
                     f"{float(raw_to_smooth_delta[i]):.6f}",
                     f"{float(smooth_to_final_delta[i]):.6f}",
                     f"{float(raw_to_final_delta[i]):.6f}",
@@ -2395,7 +3008,10 @@ class MydogPolicyNode(Node):
                     f"{float(hip_outward_after_gate[leg_i]) if hip_outward_after_gate.size >= 4 else 0.0:.6f}",
                 ]
             )
-        self._debug_csv_file.flush()
+        self._debug_csv_rows_since_flush += 1
+        if self._debug_csv_rows_since_flush >= self.debug_csv_flush_every_n:
+            self._debug_csv_file.flush()
+            self._debug_csv_rows_since_flush = 0
 
     def prepare_action_for_target(self, action_policy: np.ndarray) -> np.ndarray:
         action = np.asarray(action_policy, dtype=np.float32).reshape(12).copy()
@@ -2405,51 +3021,53 @@ class MydogPolicyNode(Node):
 
         return self.apply_action_multipliers(action)
 
-    @staticmethod
-    def swap_action_legs_yaw_180(action_policy: np.ndarray) -> np.ndarray:
+    def swap_action_legs_yaw_180(self, action_policy: np.ndarray) -> np.ndarray:
         action = np.asarray(action_policy, dtype=np.float32).reshape(12)
-        swapped = np.zeros(12, dtype=np.float32)
+        swapped = action.copy()
+        mapper = self.obs_builder.mapper
+        leg_indices = {}
+        for i, name in enumerate(mapper.policy_joint_names):
+            leg = self.leg_prefix_from_joint_name(name)
+            leg_indices.setdefault(leg, []).append(i)
 
-        # Policy order is FR, FL, RR, RL. A 180-degree leg semantic swap maps:
-        # FR <-> RL and FL <-> RR. Keep each leg's hip/thigh/calf order.
-        swapped[0:3] = action[9:12]    # FR <- RL
-        swapped[3:6] = action[6:9]     # FL <- RR
-        swapped[6:9] = action[3:6]     # RR <- FL
-        swapped[9:12] = action[0:3]    # RL <- FR
-        return swapped
+        for leg_a, leg_b in (("FR", "RL"), ("FL", "RR")):
+            idx_a = leg_indices.get(leg_a)
+            idx_b = leg_indices.get(leg_b)
+            if not idx_a or not idx_b or len(idx_a) != len(idx_b):
+                continue
+            values_a = action[idx_a].copy()
+            values_b = action[idx_b].copy()
+            for j, (ia, ib) in enumerate(zip(idx_a, idx_b)):
+                swapped[ia] = values_b[j]
+                swapped[ib] = values_a[j]
+        return swapped.astype(np.float32)
 
     def apply_action_multipliers(self, action_policy: np.ndarray) -> np.ndarray:
         action = np.asarray(action_policy, dtype=np.float32).reshape(12).copy()
+        mapper = self.obs_builder.mapper
 
-        front_joint_mul = np.array(
-            [
-                self.hip_action_scale_mul,
-                self.thigh_action_scale_mul * self.thigh_action_sign,
-                self.calf_action_scale_mul,
-            ],
-            dtype=np.float32,
-        )
-        rear_joint_mul = np.array(
-            [
-                self.hip_action_scale_mul,
-                self.rear_thigh_action_scale_mul * self.thigh_action_sign,
-                self.rear_calf_action_scale_mul,
-            ],
-            dtype=np.float32,
-        )
-
-        # Policy order is FR, FL, RR, RL.  Stage-1B training uses larger rear
-        # thigh/calf action scales than the front legs, so deployment must not
-        # collapse the rear swing amplitude back to the old uniform scale.
-        mul = np.concatenate(
-            (
-                self.front_action_scale_mul * front_joint_mul,
-                self.front_action_scale_mul * front_joint_mul,
-                self.rear_action_scale_mul * rear_joint_mul,
-                self.rear_action_scale_mul * rear_joint_mul,
+        for i, name in enumerate(mapper.policy_joint_names):
+            leg = self.leg_prefix_from_joint_name(name)
+            is_rear = leg in ("RL", "RR")
+            leg_mul = (
+                self.rear_action_scale_mul if is_rear else self.front_action_scale_mul
             )
-        ).astype(np.float32)
-        action *= mul
+            if "hip" in name:
+                joint_mul = self.hip_action_scale_mul
+            elif "thigh" in name:
+                thigh_mul = (
+                    self.rear_thigh_action_scale_mul
+                    if is_rear
+                    else self.thigh_action_scale_mul
+                )
+                joint_mul = thigh_mul * self.thigh_action_sign
+            else:
+                joint_mul = (
+                    self.rear_calf_action_scale_mul
+                    if is_rear
+                    else self.calf_action_scale_mul
+                )
+            action[i] *= leg_mul * joint_mul
 
         if self.clip_action:
             clip_limit = abs(float(self.action_clip_limit))
@@ -2508,8 +3126,8 @@ class MydogPolicyNode(Node):
             dq_policy = self.obs_builder.transform_policy_array_for_obs(dq_policy)
             info["q_policy"] = q_policy.copy()
             info["dq_policy"] = dq_policy.copy()
-            obs[12:24] = q_policy
-            obs[24:36] = dq_policy
+            obs[12:24] = q_policy * self.obs_builder.dof_pos_scale
+            obs[24:36] = dq_policy * self.obs_builder.dof_vel_scale
             if obs.shape[0] >= 48:
                 obs[36:48] = self.obs_builder.last_action
             if obs.shape[0] >= 50:
@@ -2598,13 +3216,14 @@ class MydogPolicyNode(Node):
         if flags:
             print("[POLICY_DEBUG][WARN] " + " | ".join(flags), flush=True)
 
+        policy_names = self.obs_builder.mapper.get_policy_joint_names()
         print(
-            "action_raw[12] policy order = FR, FL, RR, RL:",
+            f"action_raw[12] policy order = {policy_names}:",
             self.format_array(action_raw),
             flush=True,
         )
         print(
-            "action[12] used for q_des, policy order = FR, FL, RR, RL:",
+            f"action[12] used for q_des, policy order = {policy_names}:",
             self.format_array(action),
             flush=True,
         )
@@ -2652,12 +3271,17 @@ class MydogPolicyNode(Node):
         )
 
     def destroy_node(self):
+        self._stop_debug_csv_worker()
         try:
             if self._debug_csv_file is not None:
                 self._debug_csv_file.flush()
                 self._debug_csv_file.close()
         except Exception:
             pass
+        if self._debug_csv_dropped:
+            self.get_logger().warn(
+                f"[DEBUG_CSV] dropped {self._debug_csv_dropped} records because the queue was full"
+            )
         try:
             self.obs_builder.stop()
         except Exception:
