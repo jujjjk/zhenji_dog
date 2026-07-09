@@ -31,7 +31,17 @@ def generate_launch_description():
             "base_lin_vel_source": "estimator",
             "policy_hz": 50.0,
             "action_mode": "pure_rl",
-            "enable_cmd_smoothing": False,
+            "enable_cmd_smoothing": LaunchConfiguration("enable_cmd_smoothing"),
+            "max_cmd_x_rate_mps2": LaunchConfiguration("max_cmd_x_rate_mps2"),
+            "max_cmd_y_rate_mps2": LaunchConfiguration("max_cmd_y_rate_mps2"),
+            "max_cmd_yaw_rate_rad_s2": LaunchConfiguration("max_cmd_yaw_rate_rad_s2"),
+            "enable_cmd_limits": LaunchConfiguration("enable_cmd_limits"),
+            "cmd_min_x": LaunchConfiguration("cmd_min_x"),
+            "cmd_max_x": LaunchConfiguration("cmd_max_x"),
+            "cmd_min_y": LaunchConfiguration("cmd_min_y"),
+            "cmd_max_y": LaunchConfiguration("cmd_max_y"),
+            "cmd_min_yaw": LaunchConfiguration("cmd_min_yaw"),
+            "cmd_max_yaw": LaunchConfiguration("cmd_max_yaw"),
             "clip_action": False,
             "enable_send": LaunchConfiguration("enable_send"),
             "print_only": LaunchConfiguration("print_only"),
@@ -50,6 +60,34 @@ def generate_launch_description():
             "startup_stand_stop_torque_nm": LaunchConfiguration("startup_stand_stop_torque_nm"),
             "require_cmd_vel": True,
             "cmd_vel_timeout_sec": LaunchConfiguration("cmd_vel_timeout_sec"),
+            "zero_cmd_inhibits_policy": LaunchConfiguration("zero_cmd_inhibits_policy"),
+            "enable_zero_cmd_stand_protection": LaunchConfiguration(
+                "enable_zero_cmd_stand_protection"
+            ),
+            "zero_cmd_stand_x_threshold": LaunchConfiguration(
+                "zero_cmd_stand_x_threshold"
+            ),
+            "zero_cmd_stand_y_threshold": LaunchConfiguration(
+                "zero_cmd_stand_y_threshold"
+            ),
+            "zero_cmd_stand_yaw_threshold": LaunchConfiguration(
+                "zero_cmd_stand_yaw_threshold"
+            ),
+            "enable_policy_action_cmd_gate": LaunchConfiguration(
+                "enable_policy_action_cmd_gate"
+            ),
+            "policy_action_cmd_gate_start_ratio": LaunchConfiguration(
+                "policy_action_cmd_gate_start_ratio"
+            ),
+            "policy_action_cmd_gate_full_ratio": LaunchConfiguration(
+                "policy_action_cmd_gate_full_ratio"
+            ),
+            "policy_action_cmd_gate_max_scale": LaunchConfiguration(
+                "policy_action_cmd_gate_max_scale"
+            ),
+            "reset_gait_phase_on_command_start": LaunchConfiguration(
+                "reset_gait_phase_on_command_start"
+            ),
             "max_motor_age_ms": LaunchConfiguration("max_motor_age_ms"),
             "motor_state_async": LaunchConfiguration("motor_state_async"),
             "motor_state_poll_hz": LaunchConfiguration("motor_state_poll_hz"),
@@ -60,6 +98,11 @@ def generate_launch_description():
             "model_kp_scale": LaunchConfiguration("model_kp_scale"),
             "model_kd_scale": LaunchConfiguration("model_kd_scale"),
             "motor_torque_limit_nm": LaunchConfiguration("motor_torque_limit_nm"),
+            "torque_limit_nm": LaunchConfiguration("torque_limit_nm"),
+            "torque_safety_budget_nm": LaunchConfiguration("torque_safety_budget_nm"),
+            "expected_active_torque_budget_nm": LaunchConfiguration(
+                "expected_active_torque_budget_nm"
+            ),
             "max_target_rate_rad_s": LaunchConfiguration("max_target_rate_rad_s"),
             "max_target_accel_rad_s2": LaunchConfiguration("max_target_accel_rad_s2"),
             "calf_target_rate_mul": LaunchConfiguration("calf_target_rate_mul"),
@@ -71,6 +114,8 @@ def generate_launch_description():
             "debug_csv_async": LaunchConfiguration("debug_csv_async"),
             "debug_csv_queue_size": LaunchConfiguration("debug_csv_queue_size"),
             "debug_csv_flush_every_n": LaunchConfiguration("debug_csv_flush_every_n"),
+            "expected_policy_task": LaunchConfiguration("expected_policy_task"),
+            "expected_policy_sha256": LaunchConfiguration("expected_policy_sha256"),
         }],
     )
 
@@ -82,6 +127,17 @@ def generate_launch_description():
         DeclareLaunchArgument("motor_base_url", default_value="http://127.0.0.1:8000"),
         DeclareLaunchArgument("enable_send", default_value="false"),
         DeclareLaunchArgument("print_only", default_value="false"),
+        DeclareLaunchArgument("enable_cmd_smoothing", default_value="false"),
+        DeclareLaunchArgument("max_cmd_x_rate_mps2", default_value="0.05"),
+        DeclareLaunchArgument("max_cmd_y_rate_mps2", default_value="0.05"),
+        DeclareLaunchArgument("max_cmd_yaw_rate_rad_s2", default_value="0.3"),
+        DeclareLaunchArgument("enable_cmd_limits", default_value="true"),
+        DeclareLaunchArgument("cmd_min_x", default_value="0.10"),
+        DeclareLaunchArgument("cmd_max_x", default_value="0.20"),
+        DeclareLaunchArgument("cmd_min_y", default_value="0.0"),
+        DeclareLaunchArgument("cmd_max_y", default_value="0.0"),
+        DeclareLaunchArgument("cmd_min_yaw", default_value="0.0"),
+        DeclareLaunchArgument("cmd_max_yaw", default_value="0.0"),
         DeclareLaunchArgument("startup_stand_first", default_value="true"),
         DeclareLaunchArgument("startup_stand_kp", default_value="12.0"),
         DeclareLaunchArgument("startup_stand_kd", default_value="2.0"),
@@ -96,6 +152,16 @@ def generate_launch_description():
         DeclareLaunchArgument("startup_stand_stop_error_rad", default_value="0.30"),
         DeclareLaunchArgument("startup_stand_stop_torque_nm", default_value="8.0"),
         DeclareLaunchArgument("cmd_vel_timeout_sec", default_value="0.5"),
+        DeclareLaunchArgument("zero_cmd_inhibits_policy", default_value="true"),
+        DeclareLaunchArgument("enable_zero_cmd_stand_protection", default_value="false"),
+        DeclareLaunchArgument("zero_cmd_stand_x_threshold", default_value="0.01"),
+        DeclareLaunchArgument("zero_cmd_stand_y_threshold", default_value="0.01"),
+        DeclareLaunchArgument("zero_cmd_stand_yaw_threshold", default_value="0.03"),
+        DeclareLaunchArgument("enable_policy_action_cmd_gate", default_value="false"),
+        DeclareLaunchArgument("policy_action_cmd_gate_start_ratio", default_value="0.05"),
+        DeclareLaunchArgument("policy_action_cmd_gate_full_ratio", default_value="1.0"),
+        DeclareLaunchArgument("policy_action_cmd_gate_max_scale", default_value="1.0"),
+        DeclareLaunchArgument("reset_gait_phase_on_command_start", default_value="false"),
         DeclareLaunchArgument("require_online", default_value="true"),
         DeclareLaunchArgument("max_motor_age_ms", default_value="100.0"),
         DeclareLaunchArgument("motor_state_async", default_value="true"),
@@ -104,8 +170,11 @@ def generate_launch_description():
         DeclareLaunchArgument("send_kd", default_value="1.2"),
         DeclareLaunchArgument("use_model_pd_gains", default_value="true"),
         DeclareLaunchArgument("model_kp_scale", default_value="1.0"),
-        DeclareLaunchArgument("model_kd_scale", default_value="2.0"),
+        DeclareLaunchArgument("model_kd_scale", default_value="1.0"),
         DeclareLaunchArgument("motor_torque_limit_nm", default_value="6.0"),
+        DeclareLaunchArgument("torque_limit_nm", default_value="-1.0"),
+        DeclareLaunchArgument("torque_safety_budget_nm", default_value="-1.0"),
+        DeclareLaunchArgument("expected_active_torque_budget_nm", default_value="-1.0"),
         DeclareLaunchArgument("max_target_rate_rad_s", default_value="2.0"),
         DeclareLaunchArgument("max_target_accel_rad_s2", default_value="60.0"),
         DeclareLaunchArgument("calf_target_rate_mul", default_value="3.0"),
@@ -120,6 +189,11 @@ def generate_launch_description():
         DeclareLaunchArgument("debug_csv_async", default_value="true"),
         DeclareLaunchArgument("debug_csv_queue_size", default_value="128"),
         DeclareLaunchArgument("debug_csv_flush_every_n", default_value="20"),
+        DeclareLaunchArgument("expected_policy_task", default_value="FanfanStraightPD8Cfg"),
+        DeclareLaunchArgument(
+            "expected_policy_sha256",
+            default_value="e12d25d718e6afe12dc84368341f42dbb9eb156e1a23aea83bdc9982410450e3",
+        ),
         state_estimator,
         policy,
     ])

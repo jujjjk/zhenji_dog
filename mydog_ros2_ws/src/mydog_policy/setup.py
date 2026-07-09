@@ -36,6 +36,10 @@ setup(
             'fanfan_cpg_vmc_v4_migration_node = mydog_policy.fanfan_cpg_vmc_v4_migration_node:main',
             'mydog_soft_body_gait_node = mydog_policy.openloop_gait_node_soft_body_urdf:main',
             'mydog_joint_semantic_test_node = mydog_policy.joint_semantic_test_node:main',
+            'mydog_validate_omni_fast = mydog_policy.validate_omni_fast:main',
+            'mydog_validate_omni_yaw_clean = mydog_policy.validate_omni_fast:main',
+            'mydog_omni_fast_command = mydog_policy.omni_fast_command:main',
+            'mydog_omni_yaw_clean_command = mydog_policy.omni_fast_command:main',
         ],
     },
 )
