@@ -40,6 +40,7 @@ setup(
             'mydog_validate_omni_yaw_clean = mydog_policy.validate_omni_fast:main',
             'mydog_omni_fast_command = mydog_policy.omni_fast_command:main',
             'mydog_omni_yaw_clean_command = mydog_policy.omni_fast_command:main',
+            'mydog_policy_parity_node = mydog_policy.sim2real_parity_node:main',
         ],
     },
 )
