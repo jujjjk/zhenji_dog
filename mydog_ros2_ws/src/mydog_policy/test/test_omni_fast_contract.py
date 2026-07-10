@@ -116,16 +116,17 @@ def test_yaw_clean_launch_uses_requested_initial_safety_limits():
     assert '"cmd_min_yaw": "-0.25"' in source
     assert '"cmd_max_yaw": "0.25"' in source
     assert 'DeclareLaunchArgument("motor_torque_limit_nm", default_value="8.0")' in source
-    assert 'DeclareLaunchArgument("model_kp_scale", default_value="0.8")' in source
+    assert 'DeclareLaunchArgument("model_kp_scale", default_value="1.0")' in source
     assert 'DeclareLaunchArgument("model_kd_scale", default_value="1.0")' in source
     assert '"enable_zero_cmd_stand_protection": "true"' in source
     assert '"zero_cmd_stand_x_threshold": "0.01"' in source
     assert '"zero_cmd_stand_y_threshold": "0.01"' in source
     assert '"zero_cmd_stand_yaw_threshold": "0.03"' in source
     assert '"enable_policy_action_cmd_gate": "true"' in source
+    assert '"deployment_gait_phase_period_scale": "1.35"' in source
     assert '"policy_action_cmd_gate_start_ratio": "0.05"' in source
-    assert '"policy_action_cmd_gate_full_ratio": "1.0"' in source
-    assert '"policy_action_cmd_gate_max_scale": "0.65"' in source
+    assert '"policy_action_cmd_gate_full_ratio": "0.5"' in source
+    assert '"policy_action_cmd_gate_max_scale": "0.9"' in source
     assert '"reset_gait_phase_on_command_start": "true"' in source
     assert 'fanfan_yaw_clean_5100.onnx' in source
     assert 'fanfan_yaw_clean_sim2real.csv' in source

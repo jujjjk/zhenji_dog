@@ -331,6 +331,10 @@ class MydogPolicyNode(Node):
         self.declare_parameter("target_smoothing_fixed_dt", True)
         self.declare_parameter("target_smoothing_follow_sent_target", True)
         self.declare_parameter("gait_phase_period", 0.55)
+        self.declare_parameter("deployment_gait_phase_period_scale", 1.0)
+        self.declare_parameter("deployment_command_scale_x_mul", 1.0)
+        self.declare_parameter("deployment_command_scale_y_mul", 1.0)
+        self.declare_parameter("deployment_command_scale_yaw_mul", 1.0)
         self.declare_parameter("enable_cmd_smoothing", True)
         self.declare_parameter("max_cmd_x_rate_mps2", 0.05)
         self.declare_parameter("max_cmd_y_rate_mps2", 0.05)
@@ -571,6 +575,19 @@ class MydogPolicyNode(Node):
             self.get_parameter("target_smoothing_follow_sent_target").value
         )
         self.gait_phase_period = float(self.get_parameter("gait_phase_period").value)
+        self.deployment_gait_phase_period_scale = max(
+            0.1, float(self.get_parameter("deployment_gait_phase_period_scale").value)
+        )
+        self.deployment_command_scale_mul = np.array([
+            float(self.get_parameter("deployment_command_scale_x_mul").value),
+            float(self.get_parameter("deployment_command_scale_y_mul").value),
+            float(self.get_parameter("deployment_command_scale_yaw_mul").value),
+        ], dtype=np.float32)
+        if (
+            not np.all(np.isfinite(self.deployment_command_scale_mul))
+            or np.any(self.deployment_command_scale_mul < 0.0)
+        ):
+            raise ValueError("deployment command scale multipliers must be finite and non-negative")
         self.enable_cmd_smoothing = bool(self.get_parameter("enable_cmd_smoothing").value)
         self.max_cmd_x_rate_mps2 = float(self.get_parameter("max_cmd_x_rate_mps2").value)
         self.max_cmd_y_rate_mps2 = float(self.get_parameter("max_cmd_y_rate_mps2").value)
@@ -812,6 +829,19 @@ class MydogPolicyNode(Node):
         self._loop_rate_window_start = time.perf_counter()
         self._loop_rate_last_tick = None
         self._loop_period_samples = []
+        self._policy_loop_count = 0
+        self._policy_steps_since_last_csv = 0
+        self._motor_send_count = 0
+        self._motor_sends_since_last_csv = 0
+        self._last_policy_loop_dt_ms = 0.0
+        self._last_policy_loop_hz = 0.0
+        self._last_loop_overrun_ms = 0.0
+        self._last_motor_send_time_perf = None
+        self._last_motor_send_dt_ms = 0.0
+        self._last_motor_send_hz = 0.0
+        self._last_motor_state_poll_dt_ms = 0.0
+        self._last_onnx_infer_dt_ms = 0.0
+        self._last_state_age_ms = 0.0
         self._last_debug_print_time = 0.0
         self._last_debug_csv_time = 0.0
         self._smooth_target_real = None
@@ -878,7 +908,17 @@ class MydogPolicyNode(Node):
                         f"({exported_hz:.3f} Hz)"
                     )
                 self.policy_hz = exported_hz
-                self.gait_phase_period = float(self.deployment_config["gait"]["period"])
+                self.gait_phase_period = (
+                    float(self.deployment_config["gait"]["period"])
+                    * self.deployment_gait_phase_period_scale
+                )
+                if abs(self.deployment_gait_phase_period_scale - 1.0) > 1.0e-6:
+                    self.get_logger().warn(
+                        "deployment gait phase period scaled: "
+                        f"model={float(self.deployment_config['gait']['period']):.3f}s "
+                        f"scale={self.deployment_gait_phase_period_scale:.3f} "
+                        f"active={self.gait_phase_period:.3f}s"
+                    )
                 if self.action_mode != "pure_rl":
                     self.get_logger().warn(
                         f"action_mode={self.action_mode!r} overridden with pure_rl; "
@@ -970,6 +1010,20 @@ class MydogPolicyNode(Node):
             motor_state_async=self.motor_state_async,
             motor_state_poll_hz=self.motor_state_poll_hz,
         )
+        self.obs_builder.gait_phase_period = self.gait_phase_period
+        self.obs_builder.gait_phase_start_time = time.time()
+        self.obs_builder.last_gait_phase = 0.0
+        if np.any(np.abs(self.deployment_command_scale_mul - 1.0) > 1.0e-6):
+            old_scale = self.obs_builder.command_scale.copy()
+            self.obs_builder.command_scale = (
+                self.obs_builder.command_scale * self.deployment_command_scale_mul
+            ).astype(np.float32)
+            self.get_logger().warn(
+                "[OBS] deployment command scale override: "
+                f"model={old_scale.tolist()} "
+                f"mul={self.deployment_command_scale_mul.tolist()} "
+                f"active={self.obs_builder.command_scale.tolist()}"
+            )
         self.obs_builder.start()
         self.obs_builder.set_command(0.0, 0.0, 0.0)
         self.deploy_cpg = self.create_deploy_cpg()
@@ -1946,6 +2000,7 @@ class MydogPolicyNode(Node):
 
     def control_loop(self):
         self._record_control_loop_rate()
+        self._last_onnx_infer_dt_ms = 0.0
         try:
             dt = self.get_control_dt()
             self.update_smoothed_command(dt)
@@ -1953,6 +2008,10 @@ class MydogPolicyNode(Node):
             obs, info = self.obs_builder.build_obs()
 
             max_age = float(np.max(info["age_ms"]))
+            self._last_state_age_ms = max_age
+            self._last_motor_state_poll_dt_ms = float(
+                info.get("motor_state_poll_dt_ms", 0.0)
+            )
 
             if max_age > self.max_motor_age_ms:
                 stale = np.where(np.asarray(info["age_ms"]) > self.max_motor_age_ms)[0]
@@ -2029,7 +2088,11 @@ class MydogPolicyNode(Node):
                     "phase": float(self.obs_builder.last_gait_phase),
                 }
             else:
+                infer_t0 = time.perf_counter()
                 action_raw = self.policy.infer(obs)
+                self._last_onnx_infer_dt_ms = (
+                    time.perf_counter() - infer_t0
+                ) * 1000.0
 
                 if self.clip_action:
                     clip_limit = abs(float(self.action_clip_limit))
@@ -2210,7 +2273,14 @@ class MydogPolicyNode(Node):
     def _record_control_loop_rate(self):
         now = time.perf_counter()
         if self._loop_rate_last_tick is not None:
-            self._loop_period_samples.append(now - self._loop_rate_last_tick)
+            dt = now - self._loop_rate_last_tick
+            self._loop_period_samples.append(dt)
+            self._last_policy_loop_dt_ms = dt * 1000.0
+            self._last_policy_loop_hz = 1.0 / dt if dt > 0.0 else 0.0
+            nominal_dt = 1.0 / max(float(self.policy_hz), 1.0e-6)
+            self._last_loop_overrun_ms = max(0.0, (dt - nominal_dt) * 1000.0)
+        self._policy_loop_count += 1
+        self._policy_steps_since_last_csv += 1
         self._loop_rate_last_tick = now
 
         elapsed = now - self._loop_rate_window_start
@@ -2621,6 +2691,15 @@ class MydogPolicyNode(Node):
                 )
                 return False
 
+            send_time_perf = time.perf_counter()
+            if self._last_motor_send_time_perf is not None:
+                send_dt = send_time_perf - self._last_motor_send_time_perf
+                self._last_motor_send_dt_ms = send_dt * 1000.0
+                self._last_motor_send_hz = 1.0 / send_dt if send_dt > 0.0 else 0.0
+            self._last_motor_send_time_perf = send_time_perf
+            self._motor_send_count += 1
+            self._motor_sends_since_last_csv += 1
+
             vel_log = (
                 f"vel_cmd_abs_max={float(np.max(np.abs(motor_vel_cmd))):.3f} | "
                 if self.log_motor_vel_cmd
@@ -2726,6 +2805,7 @@ class MydogPolicyNode(Node):
                 "obs_cmd_x",
                 "obs_cmd_y",
                 "obs_cmd_wz",
+                "command_scale_effective_x",
                 "obs_joint_pos_policy",
                 "obs_joint_vel_policy",
                 "obs_last_action_policy",
@@ -2789,6 +2869,16 @@ class MydogPolicyNode(Node):
                 "hip_outward_after_gate",
                 "action_cmd_gate_scale",
                 "zero_cmd_stand_active",
+                "policy_loop_dt_ms",
+                "policy_loop_hz",
+                "motor_send_dt_ms",
+                "motor_send_hz",
+                "motor_state_poll_dt_ms",
+                "onnx_infer_dt_ms",
+                "policy_steps_since_last_csv",
+                "motor_sends_since_last_csv",
+                "state_age_ms",
+                "loop_overrun_ms",
             ]
         )
         self._debug_csv_file.flush()
@@ -2830,6 +2920,24 @@ class MydogPolicyNode(Node):
                 self.get_logger().error("[DEBUG_CSV] writer did not stop within 5 seconds")
         self._debug_csv_thread = None
 
+    def make_debug_timing_info(self) -> dict:
+        return {
+            "policy_loop_dt_ms": float(self._last_policy_loop_dt_ms),
+            "policy_loop_hz": float(self._last_policy_loop_hz),
+            "motor_send_dt_ms": float(self._last_motor_send_dt_ms),
+            "motor_send_hz": float(self._last_motor_send_hz),
+            "motor_state_poll_dt_ms": float(self._last_motor_state_poll_dt_ms),
+            "onnx_infer_dt_ms": float(self._last_onnx_infer_dt_ms),
+            "policy_steps_since_last_csv": int(self._policy_steps_since_last_csv),
+            "motor_sends_since_last_csv": int(self._motor_sends_since_last_csv),
+            "state_age_ms": float(self._last_state_age_ms),
+            "loop_overrun_ms": float(self._last_loop_overrun_ms),
+        }
+
+    def reset_debug_csv_timing_counters(self):
+        self._policy_steps_since_last_csv = 0
+        self._motor_sends_since_last_csv = 0
+
     def maybe_write_policy_csv(self, *args, **kwargs):
         if self._debug_csv_writer is None:
             return
@@ -2840,8 +2948,11 @@ class MydogPolicyNode(Node):
                 return
         self._last_debug_csv_time = now
 
+        kwargs = dict(kwargs)
+        kwargs["timing_info"] = self.make_debug_timing_info()
         if not self.debug_csv_async:
             self._write_policy_csv_sync(*args, record_time=now, **kwargs)
+            self.reset_debug_csv_timing_counters()
             return
         if self._debug_csv_stop.is_set():
             return
@@ -2853,6 +2964,7 @@ class MydogPolicyNode(Node):
         record = copy.deepcopy((args, queued_kwargs))
         try:
             self._debug_csv_queue.put_nowait(record)
+            self.reset_debug_csv_timing_counters()
         except queue.Full:
             self._debug_csv_dropped += 1
 
@@ -2883,6 +2995,7 @@ class MydogPolicyNode(Node):
         joint_probe_delta_rad: float = 0.0,
         joint_probe_name: str = "",
         record_time: float = None,
+        timing_info: dict = None,
     ):
         if self._debug_csv_writer is None:
             return
@@ -2937,6 +3050,9 @@ class MydogPolicyNode(Node):
         torque_limit_info = {} if torque_limit_info is None else torque_limit_info
         rear_bias_info = {} if rear_bias_info is None else rear_bias_info
         cpg_action_info = {} if cpg_action_info is None else cpg_action_info
+        timing_info = (
+            self.make_debug_timing_info() if timing_info is None else timing_info
+        )
 
         def info_vec(info, key, default):
             value = info.get(key, default)
@@ -3052,6 +3168,9 @@ class MydogPolicyNode(Node):
             obs_gravity[:] = obs[6:9]
         if obs.shape[0] >= 12:
             obs_cmd[:] = obs[9:12]
+        command_scale_effective_x = float(
+            np.asarray(self.obs_builder.command_scale, dtype=np.float32).reshape(3)[0]
+        )
         if obs.shape[0] >= 24:
             obs_joint_pos[:] = obs[12:24]
         if obs.shape[0] >= 36:
@@ -3129,6 +3248,22 @@ class MydogPolicyNode(Node):
             csv_kp_real = self.send_kp_real
             csv_kd_real = self.send_kd_real
         global_gait_phase = float(self.obs_builder.last_gait_phase)
+        policy_loop_dt_ms = float(timing_info.get("policy_loop_dt_ms", 0.0))
+        policy_loop_hz = float(timing_info.get("policy_loop_hz", 0.0))
+        motor_send_dt_ms = float(timing_info.get("motor_send_dt_ms", 0.0))
+        motor_send_hz = float(timing_info.get("motor_send_hz", 0.0))
+        motor_state_poll_dt_ms = float(
+            timing_info.get("motor_state_poll_dt_ms", 0.0)
+        )
+        onnx_infer_dt_ms = float(timing_info.get("onnx_infer_dt_ms", 0.0))
+        policy_steps_since_last_csv = int(
+            timing_info.get("policy_steps_since_last_csv", 0)
+        )
+        motor_sends_since_last_csv = int(
+            timing_info.get("motor_sends_since_last_csv", 0)
+        )
+        state_age_ms = float(timing_info.get("state_age_ms", max_age))
+        loop_overrun_ms = float(timing_info.get("loop_overrun_ms", 0.0))
 
         for i, (mid, name) in enumerate(zip(motor_ids, real_names)):
             policy_i = int(real_to_policy_index[i])
@@ -3204,6 +3339,7 @@ class MydogPolicyNode(Node):
                     f"{float(obs_cmd[0]):.6f}",
                     f"{float(obs_cmd[1]):.6f}",
                     f"{float(obs_cmd[2]):.6f}",
+                    f"{command_scale_effective_x:.6f}",
                     f"{float(obs_joint_pos[policy_i]):.6f}",
                     f"{float(obs_joint_vel[policy_i]):.6f}",
                     f"{float(obs_last_action[policy_i]):.6f}",
@@ -3267,6 +3403,16 @@ class MydogPolicyNode(Node):
                     f"{float(hip_outward_after_gate[leg_i]) if hip_outward_after_gate.size >= 4 else 0.0:.6f}",
                     f"{float(cpg_action_info.get('command_gate_scale', self._last_action_cmd_gate_scale)):.6f}",
                     int(cpg_action_info.get("zero_cmd_stand", self._last_zero_cmd_stand_active)),
+                    f"{policy_loop_dt_ms:.3f}",
+                    f"{policy_loop_hz:.3f}",
+                    f"{motor_send_dt_ms:.3f}",
+                    f"{motor_send_hz:.3f}",
+                    f"{motor_state_poll_dt_ms:.3f}",
+                    f"{onnx_infer_dt_ms:.3f}",
+                    policy_steps_since_last_csv,
+                    motor_sends_since_last_csv,
+                    f"{state_age_ms:.3f}",
+                    f"{loop_overrun_ms:.3f}",
                 ]
             )
         self._debug_csv_rows_since_flush += 1

@@ -35,6 +35,18 @@ def generate_launch_description():
             "max_cmd_x_rate_mps2": LaunchConfiguration("max_cmd_x_rate_mps2"),
             "max_cmd_y_rate_mps2": LaunchConfiguration("max_cmd_y_rate_mps2"),
             "max_cmd_yaw_rate_rad_s2": LaunchConfiguration("max_cmd_yaw_rate_rad_s2"),
+            "deployment_gait_phase_period_scale": LaunchConfiguration(
+                "deployment_gait_phase_period_scale"
+            ),
+            "deployment_command_scale_x_mul": LaunchConfiguration(
+                "deployment_command_scale_x_mul"
+            ),
+            "deployment_command_scale_y_mul": LaunchConfiguration(
+                "deployment_command_scale_y_mul"
+            ),
+            "deployment_command_scale_yaw_mul": LaunchConfiguration(
+                "deployment_command_scale_yaw_mul"
+            ),
             "enable_cmd_limits": LaunchConfiguration("enable_cmd_limits"),
             "cmd_min_x": LaunchConfiguration("cmd_min_x"),
             "cmd_max_x": LaunchConfiguration("cmd_max_x"),
@@ -131,6 +143,10 @@ def generate_launch_description():
         DeclareLaunchArgument("max_cmd_x_rate_mps2", default_value="0.05"),
         DeclareLaunchArgument("max_cmd_y_rate_mps2", default_value="0.05"),
         DeclareLaunchArgument("max_cmd_yaw_rate_rad_s2", default_value="0.3"),
+        DeclareLaunchArgument("deployment_gait_phase_period_scale", default_value="1.0"),
+        DeclareLaunchArgument("deployment_command_scale_x_mul", default_value="1.0"),
+        DeclareLaunchArgument("deployment_command_scale_y_mul", default_value="1.0"),
+        DeclareLaunchArgument("deployment_command_scale_yaw_mul", default_value="1.0"),
         DeclareLaunchArgument("enable_cmd_limits", default_value="true"),
         DeclareLaunchArgument("cmd_min_x", default_value="0.10"),
         DeclareLaunchArgument("cmd_max_x", default_value="0.20"),

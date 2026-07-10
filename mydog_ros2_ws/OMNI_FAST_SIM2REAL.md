@@ -69,13 +69,15 @@ vx limit: +/-0.12 m/s
 vy limit: +/-0.025 m/s
 yaw limit: +/-0.25 rad/s
 use_model_pd_gains: true
-model_kp_scale: 0.8
+model_kp_scale: 1.0
 model_kd_scale: 1.0
 startup_stand_first: true
 debug_csv: enabled
 zero command stand protection: enabled
 policy action command gate: enabled
-policy action/gait max gate scale: 0.65
+policy action/gait full ratio: 0.5
+policy action/gait max gate scale: 0.9
+deployment gait phase period scale: 1.35
 reset gait phase on command start: enabled
 ```
 
@@ -88,8 +90,9 @@ ros2 launch mydog_policy sim2real_omni_fast.launch.py \
   enable_send:=true \
   startup_stand_first:=true \
   motor_torque_limit_nm:=8.0 \
-  model_kp_scale:=0.8 \
+  model_kp_scale:=1.0 \
   model_kd_scale:=1.0 \
+  deployment_gait_phase_period_scale:=1.35 \
   debug_csv_path:=/home/jetson/mydog_ros2_ws/log/fanfan_yaw_clean_air_${RUN}.csv
 ```
 
@@ -124,20 +127,22 @@ abs(cmd_wz) < 0.03
 
 Small non-zero commands are gated by command size. For example, with
 `vx=0.06` and the initial `vx` envelope of `0.12`, policy action and the ONNX
-gait reference are both scaled before target generation. The first grounded
-tests also cap the full-command gate at `0.65`, so `vx=0.12` is still softened.
+gait reference now reach the walking gate cap. The grounded test cap is `0.9`,
+so `vx=0.12` is softened slightly but still has enough authority to move.
 When a command starts from stand, the gait phase is reset so the swing pattern
-does not begin from an arbitrary wall-clock phase. The CSV appends:
+does not begin from an arbitrary wall-clock phase. The gait phase period is
+scaled from the model's `0.54 s` to about `0.73 s`, lowering the real-robot
+step frequency from about `1.85 Hz` to `1.37 Hz`. The CSV appends:
 
 ```text
 action_cmd_gate_scale
 zero_cmd_stand_active
 ```
 
-For the next suspended test, `cmd=0` rows should have `action_used` near zero,
-`gait_ref_policy` near zero, and `torque_limited` close to zero. After zero
-command is clean and the suspended run is not hitting the 8 Nm limiter, restore
-`model_kp_scale:=1.0`.
+For the next test, `cmd=0` rows should still have `action_used` near zero,
+`gait_ref_policy` near zero, and `torque_limited` close to zero. During walking,
+if it still cannot move, inspect calf `final_limited_joint_mask`, measured
+torque, and foot contact before raising the torque budget.
 
 ## Initial Presets
 

@@ -24,6 +24,7 @@ class MotorSnapshot:
     snapshot_seq: np.ndarray
     board_tick_ms: np.ndarray
     cache_age_ms: float
+    poll_dt_ms: float
     valid: bool
     raw: dict
 
@@ -62,6 +63,7 @@ class MotorStateHttpInterface:
         self._latest_error: Exception | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._last_poll_stamp_perf: float | None = None
 
         # 真机电机顺序：FR, FL, RL, RR
         # 这里用十六进制写，Python 发送请求时会自动变成对应十进制整数。
@@ -169,6 +171,16 @@ class MotorStateHttpInterface:
         raise KeyError(f"motor_id 0x{motor_id:02X} not found in /api/state response")
 
     def _fetch_latest_sync(self) -> MotorSnapshot:
+        poll_stamp_perf = time.perf_counter()
+        if self._last_poll_stamp_perf is None:
+            poll_dt_ms = 0.0
+        else:
+            poll_dt_ms = max(
+                0.0,
+                (poll_stamp_perf - self._last_poll_stamp_perf) * 1000.0,
+            )
+        self._last_poll_stamp_perf = poll_stamp_perf
+
         q = []
         dq = []
         torque = []
@@ -260,6 +272,7 @@ class MotorStateHttpInterface:
             snapshot_seq=snapshot_seq,
             board_tick_ms=board_tick_ms,
             cache_age_ms=cache_age_ms,
+            poll_dt_ms=poll_dt_ms,
             valid=valid,
             raw=raw,
         )
@@ -298,6 +311,7 @@ class MotorStateHttpInterface:
                 snapshot_seq=snap.snapshot_seq.copy(),
                 board_tick_ms=snap.board_tick_ms.copy(),
                 cache_age_ms=age_ms,
+                poll_dt_ms=snap.poll_dt_ms,
                 valid=False,
                 raw=dict(snap.raw),
             )

@@ -327,6 +327,7 @@ class ObsBuilder36:
             "online": motor_snapshot.online.copy(),
             "error_code": motor_snapshot.error_code.copy(),
             "age_ms": motor_snapshot.age_ms.copy(),
+            "motor_state_poll_dt_ms": float(motor_snapshot.poll_dt_ms),
         }
 
         return obs, info

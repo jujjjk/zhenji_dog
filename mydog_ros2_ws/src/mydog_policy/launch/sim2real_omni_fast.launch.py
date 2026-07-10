@@ -25,6 +25,16 @@ def generate_launch_description():
             "max_cmd_x_rate_mps2": "0.20",
             "max_cmd_y_rate_mps2": "0.10",
             "max_cmd_yaw_rate_rad_s2": "0.60",
+            "deployment_gait_phase_period_scale": "1.35",
+            "deployment_command_scale_x_mul": LaunchConfiguration(
+                "deployment_command_scale_x_mul"
+            ),
+            "deployment_command_scale_y_mul": LaunchConfiguration(
+                "deployment_command_scale_y_mul"
+            ),
+            "deployment_command_scale_yaw_mul": LaunchConfiguration(
+                "deployment_command_scale_yaw_mul"
+            ),
             "enable_cmd_limits": "true",
             "cmd_min_x": "-0.12",
             "cmd_max_x": "0.12",
@@ -40,8 +50,8 @@ def generate_launch_description():
             "zero_cmd_stand_yaw_threshold": "0.03",
             "enable_policy_action_cmd_gate": "true",
             "policy_action_cmd_gate_start_ratio": "0.05",
-            "policy_action_cmd_gate_full_ratio": "1.0",
-            "policy_action_cmd_gate_max_scale": "0.65",
+            "policy_action_cmd_gate_full_ratio": "0.5",
+            "policy_action_cmd_gate_max_scale": "0.9",
             "reset_gait_phase_on_command_start": "true",
             "use_model_pd_gains": "true",
             "model_kp_scale": LaunchConfiguration("model_kp_scale"),
@@ -75,9 +85,12 @@ def generate_launch_description():
         DeclareLaunchArgument("enable_send", default_value="false"),
         DeclareLaunchArgument("print_only", default_value="false"),
         DeclareLaunchArgument("startup_stand_first", default_value="true"),
-        DeclareLaunchArgument("model_kp_scale", default_value="0.8"),
+        DeclareLaunchArgument("model_kp_scale", default_value="1.0"),
         DeclareLaunchArgument("model_kd_scale", default_value="1.0"),
         DeclareLaunchArgument("motor_torque_limit_nm", default_value="8.0"),
+        DeclareLaunchArgument("deployment_command_scale_x_mul", default_value="1.0"),
+        DeclareLaunchArgument("deployment_command_scale_y_mul", default_value="1.0"),
+        DeclareLaunchArgument("deployment_command_scale_yaw_mul", default_value="1.0"),
         DeclareLaunchArgument(
             "debug_csv_path",
             default_value="/home/jetson/mydog_ros2_ws/log/fanfan_yaw_clean_sim2real.csv",
