@@ -97,5 +97,37 @@ def test_parity_launch_disables_legacy_closed_loop_modifiers():
     assert '"enable_torque_error_limit": False' in source
     assert '"enable_policy_action_cmd_gate": False' in source
     assert '"enable_velocity_ff": False' in source
-    assert '"deployment_gait_phase_period_scale": 1.0' in source
+    assert '"deployment_gait_phase_period_scale": LaunchConfiguration(' in source
+    assert 'DeclareLaunchArgument("gait_period_scale", default_value="1.00")' in source
+    assert '"gait_phase_lead_sec": LaunchConfiguration("gait_phase_lead_sec")' in source
+    assert 'DeclareLaunchArgument("gait_phase_lead_sec", default_value="0.00")' in source
     assert 'DeclareLaunchArgument("motor_torque_limit_nm", default_value="10.0")' in source
+
+
+def test_parity_node_applies_only_explicit_gait_period_scaling():
+    node_file = (
+        Path(__file__).parents[1]
+        / "mydog_policy"
+        / "sim2real_parity_node.py"
+    )
+    source = node_file.read_text(encoding="utf-8")
+    assert "self.model_gait_phase_period" in source
+    assert "self.contract_gait_period_scale" in source
+    assert "self.model_gait_phase_period * self.contract_gait_period_scale" in source
+    assert "sim2real parity gait period scale must be finite and in [1.0, 1.5]" in source
+    assert 'cpg_action_info["frequency"] = 1.0 / self.gait_phase_period' in source
+
+
+def test_parity_node_applies_one_shared_phase_lead_to_obs_and_gait():
+    node_file = (
+        Path(__file__).parents[1]
+        / "mydog_policy"
+        / "sim2real_parity_node.py"
+    )
+    source = node_file.read_text(encoding="utf-8")
+    assert 'self.declare_parameter("gait_phase_lead_sec", 0.0)' in source
+    assert "self.gait_phase_lead_sec / max(self.gait_phase_period, 1.0e-6)" in source
+    assert "self._contract_phase + self.contract_phase_lead_cycles" in source
+    assert "self.obs_builder.last_gait_phase = self._effective_contract_phase()" in source
+    assert 'cpg_action_info["phase_lead_sec"]' in source
+    assert "gait_phase_lead_sec must be finite and in [0.00, 0.10] seconds" in source

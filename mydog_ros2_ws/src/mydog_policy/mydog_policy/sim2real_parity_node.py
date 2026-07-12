@@ -25,6 +25,15 @@ class MydogPolicyParityNode(MydogPolicyNode):
     def __init__(self):
         super().__init__()
 
+        # Explicit deployment-only phase compensation.  The underlying
+        # fixed-step phase still advances exactly like simulation; only the
+        # phase exposed to the ONNX observation and reference gait is shifted.
+        if not self.has_parameter("gait_phase_lead_sec"):
+            self.declare_parameter("gait_phase_lead_sec", 0.0)
+        self.gait_phase_lead_sec = float(
+            self.get_parameter("gait_phase_lead_sec").value
+        )
+
         if self.policy is None or self.deployment_config is None:
             raise RuntimeError(
                 "sim2real parity mode requires an ONNX model with "
@@ -61,7 +70,32 @@ class MydogPolicyParityNode(MydogPolicyNode):
         self.enable_velocity_ff = False
         self.enable_rear_leg_posture_bias = False
 
-        self.gait_phase_period = float(self.deployment_config["gait"]["period"])
+        self.model_gait_phase_period = float(self.deployment_config["gait"]["period"])
+        self.contract_gait_period_scale = float(self.deployment_gait_phase_period_scale)
+        if (
+            not np.isfinite(self.contract_gait_period_scale)
+            or self.contract_gait_period_scale < 1.0
+            or self.contract_gait_period_scale > 1.5
+        ):
+            raise RuntimeError(
+                "sim2real parity gait period scale must be finite and in [1.0, 1.5]"
+            )
+        # Keep the policy-action/observation/PD contract unchanged while allowing
+        # one explicit actuator-bandwidth adaptation: a slower reference phase.
+        self.gait_phase_period = (
+            self.model_gait_phase_period * self.contract_gait_period_scale
+        )
+        if (
+            not np.isfinite(self.gait_phase_lead_sec)
+            or self.gait_phase_lead_sec < 0.0
+            or self.gait_phase_lead_sec > 0.10
+        ):
+            raise RuntimeError(
+                "gait_phase_lead_sec must be finite and in [0.00, 0.10] seconds"
+            )
+        self.contract_phase_lead_cycles = (
+            self.gait_phase_lead_sec / max(self.gait_phase_period, 1.0e-6)
+        )
         self.obs_builder.gait_phase_period = self.gait_phase_period
         self._contract_phase = 0.0
         self._contract_gait_gate = 0.0
@@ -79,8 +113,19 @@ class MydogPolicyParityNode(MydogPolicyNode):
         self.get_logger().info(
             f"[PARITY] action_filter enabled={self.contract_action_filter.config.enabled} "
             f"alpha={self.contract_action_filter.config.alpha:.3f} "
-            f"gait_period={self.gait_phase_period:.3f}s "
+            f"model_gait_period={self.model_gait_phase_period:.3f}s "
+            f"gait_period_scale={self.contract_gait_period_scale:.3f} "
+            f"active_gait_period={self.gait_phase_period:.3f}s "
+            f"active_gait_frequency={1.0 / self.gait_phase_period:.3f}Hz "
+            f"phase_lead={self.gait_phase_lead_sec:.3f}s "
+            f"phase_lead_cycles={self.contract_phase_lead_cycles:.4f} "
             f"policy_hz={self.policy_hz:.3f}"
+        )
+
+    def _effective_contract_phase(self) -> float:
+        """Return the phase seen by both ONNX and the reference gait."""
+        return float(
+            (self._contract_phase + self.contract_phase_lead_cycles) % 1.0
         )
 
     def _reset_contract_state(self, *, reset_phase: bool) -> None:
@@ -88,18 +133,19 @@ class MydogPolicyParityNode(MydogPolicyNode):
         self.obs_builder.set_last_action(np.zeros(12, dtype=np.float32))
         if reset_phase:
             self._contract_phase = 0.0
-            self.obs_builder.last_gait_phase = 0.0
+        self.obs_builder.last_gait_phase = self._effective_contract_phase()
 
     def _contract_get_gait_phase(self) -> float:
-        self.obs_builder.last_gait_phase = float(self._contract_phase)
-        return float(self._contract_phase)
+        effective_phase = self._effective_contract_phase()
+        self.obs_builder.last_gait_phase = effective_phase
+        return effective_phase
 
     def _advance_contract_phase(self) -> None:
         nominal_dt = 1.0 / max(float(self.policy_hz), 1.0e-6)
         self._contract_phase = (
             self._contract_phase + nominal_dt / max(self.gait_phase_period, 1.0e-6)
         ) % 1.0
-        self.obs_builder.last_gait_phase = float(self._contract_phase)
+        self.obs_builder.last_gait_phase = self._effective_contract_phase()
 
     def cmd_callback(self, msg):
         was_zero = bool(np.all(np.abs(self.cmd) < self.zero_cmd_stand_threshold))
@@ -310,7 +356,13 @@ class MydogPolicyParityNode(MydogPolicyNode):
                     "zero_cmd_stand": True,
                     "frequency": 0.0,
                     "phase": float(self.obs_builder.last_gait_phase),
+                    "base_phase": float(self._contract_phase),
+                    "phase_lead_sec": float(self.gait_phase_lead_sec),
                     "gait_gate": 0.0,
+                    "model_gait_period_s": self.model_gait_phase_period,
+                    "gait_period_scale": self.contract_gait_period_scale,
+                    "active_gait_period_s": self.gait_phase_period,
+                    "protection_mode": "pd_equivalent",
                 }
             else:
                 infer_t0 = time.perf_counter()
@@ -329,7 +381,14 @@ class MydogPolicyParityNode(MydogPolicyNode):
                 cpg_action_info["command_gate_scale"] = 1.0
                 cpg_action_info["zero_cmd_stand"] = False
                 cpg_action_info["phase"] = float(self.obs_builder.last_gait_phase)
+                cpg_action_info["base_phase"] = float(self._contract_phase)
+                cpg_action_info["phase_lead_sec"] = float(self.gait_phase_lead_sec)
+                cpg_action_info["frequency"] = 1.0 / self.gait_phase_period
                 cpg_action_info["gait_gate"] = float(self._contract_gait_gate)
+                cpg_action_info["model_gait_period_s"] = self.model_gait_phase_period
+                cpg_action_info["gait_period_scale"] = self.contract_gait_period_scale
+                cpg_action_info["active_gait_period_s"] = self.gait_phase_period
+                cpg_action_info["protection_mode"] = "pd_equivalent"
 
             target_real_raw = self.obs_builder.mapper.policy_target_to_real_target(
                 target_policy_abs,
@@ -387,7 +446,12 @@ class MydogPolicyParityNode(MydogPolicyNode):
                     torque_limit_info["tau_safe_signed"], dtype=np.float32
                 )
                 self.get_logger().info(
-                    f"[PARITY] cmd={self.cmd.tolist()} phase={self._contract_phase:.3f} "
+                    f"[PARITY] cmd={self.cmd.tolist()} "
+                    f"base_phase={self._contract_phase:.3f} "
+                    f"phase={self.obs_builder.last_gait_phase:.3f} "
+                    f"phase_lead={self.gait_phase_lead_sec:.3f}s "
+                    f"gait_period={self.gait_phase_period:.3f}s "
+                    f"gait_scale={self.contract_gait_period_scale:.2f} "
                     f"gait_gate={self._contract_gait_gate:.3f} "
                     f"raw_action_max={float(np.max(np.abs(action_raw))):.3f} "
                     f"filtered_action_max={float(np.max(np.abs(filtered_action))):.3f} "

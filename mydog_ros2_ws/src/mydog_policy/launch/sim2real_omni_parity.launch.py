@@ -41,7 +41,10 @@ def generate_launch_description():
             # enforces these values internally so legacy launch overrides cannot
             # silently reintroduce the old closed-loop behavior.
             "enable_cmd_smoothing": False,
-            "deployment_gait_phase_period_scale": 1.0,
+            "deployment_gait_phase_period_scale": LaunchConfiguration(
+                "gait_period_scale"
+            ),
+            "gait_phase_lead_sec": LaunchConfiguration("gait_phase_lead_sec"),
             "deployment_command_scale_x_mul": 1.0,
             "deployment_command_scale_y_mul": 1.0,
             "deployment_command_scale_yaw_mul": 1.0,
@@ -118,6 +121,10 @@ def generate_launch_description():
         DeclareLaunchArgument("enable_send", default_value="false"),
         DeclareLaunchArgument("print_only", default_value="false"),
         DeclareLaunchArgument("startup_stand_first", default_value="true"),
+        # Keep the training gait period fixed for the phase-lead A/B test.
+        DeclareLaunchArgument("gait_period_scale", default_value="1.00"),
+        # Test 0.00, 0.04 and 0.06 seconds while keeping every other variable fixed.
+        DeclareLaunchArgument("gait_phase_lead_sec", default_value="0.00"),
         DeclareLaunchArgument("motor_torque_limit_nm", default_value="10.0"),
         DeclareLaunchArgument("max_motor_age_ms", default_value="100.0"),
         DeclareLaunchArgument("debug_print_arrays", default_value="false"),

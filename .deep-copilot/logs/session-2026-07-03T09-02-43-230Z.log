@@ -1,6 +1,0 @@
-[2026-07-03T09:02:43.230Z] [INIT] Deep Copilot debug log started. file=e:\zhenji\.deep-copilot\logs\session-2026-07-03T09-02-43-230Z.log
-[2026-07-03T09:02:43.230Z] [ACTIVATE] {"version":"0.43.1"}
-[2026-07-03T09:02:43.231Z] [PROVIDERS_LOADED] {"count":4,"ids":["anthropic","custom","deepseek","openai"]}
-[2026-07-03T09:02:43.232Z] [TERMINAL_MONITOR_STARTED] {}
-[2026-07-03T09:02:43.232Z] [STATUSBAR_REGISTERED] {"id":"deepseekAgent.statusBar"}
-[2026-07-03T09:02:43.276Z] [INLINE_COMPLETION_REGISTERED]
