@@ -833,6 +833,12 @@ class MydogPolicyNode(Node):
         self._policy_steps_since_last_csv = 0
         self._motor_send_count = 0
         self._motor_sends_since_last_csv = 0
+        self._csv_cycle_sequence = 0
+        self._last_command_sequence = 0
+        self._last_send_start_time = ""
+        self._last_send_end_time = ""
+        self._last_board_a_send_time = ""
+        self._last_board_b_send_time = ""
         self._last_policy_loop_dt_ms = 0.0
         self._last_policy_loop_hz = 0.0
         self._last_loop_overrun_ms = 0.0
@@ -2678,6 +2684,9 @@ class MydogPolicyNode(Node):
 
         url = f"{self.motor_base_url}/api/rs04/motion_batch_fast"
 
+        send_start_time = time.time()
+        self._last_send_start_time = f"{send_start_time:.6f}"
+        self._last_command_sequence += 1
         try:
             r = self.http_session.post(
                 url,
@@ -2686,11 +2695,13 @@ class MydogPolicyNode(Node):
             )
 
             if r.status_code != 200:
+                self._last_send_end_time = f"{time.time():.6f}"
                 self.get_logger().warn(
                     f"[SEND] HTTP {r.status_code}: {r.text}"
                 )
                 return False
 
+            self._last_send_end_time = f"{time.time():.6f}"
             send_time_perf = time.perf_counter()
             if self._last_motor_send_time_perf is not None:
                 send_dt = send_time_perf - self._last_motor_send_time_perf
@@ -2738,6 +2749,46 @@ class MydogPolicyNode(Node):
 
         self._debug_csv_file = open(path, "w", newline="")
         self._debug_csv_writer = csv.writer(self._debug_csv_file)
+        # One row is one policy cycle.  Per-joint values are expanded into
+        # columns so cycle_sequence remains the unambiguous join key.
+        joint_names = list(self.obs_builder.mapper.real_joint_names)
+        cycle_headers = [
+            "timestamp", "cycle_sequence", "phase", "cmd_vx", "cmd_vy", "cmd_yaw",
+            "policy_loop_hz", "state_age_ms", "send_start_time", "send_end_time",
+            "board_A_send_time", "board_B_send_time", "command_sequence",
+        ]
+        for joint_name in joint_names:
+            safe_name = str(joint_name).replace("-", "_").replace(" ", "_")
+            cycle_headers.extend([
+                f"{safe_name}_q_target_raw",
+                f"{safe_name}_q_target_safe",
+                f"{safe_name}_q_current",
+                f"{safe_name}_dq_current",
+                f"{safe_name}_raw_pd_torque",
+                f"{safe_name}_limited_torque",
+                f"{safe_name}_feedback_torque",
+                f"{safe_name}_torque_limited_flag",
+                f"{safe_name}_motor_online",
+                f"{safe_name}_motor_fault",
+            ])
+        self._debug_csv_writer.writerow(cycle_headers)
+        self._debug_csv_file.flush()
+        self.get_logger().warn(f"[DEBUG_CSV] writing 50Hz cycle log to {path}")
+        if self.debug_csv_async:
+            self._debug_csv_stop.clear()
+            self._debug_csv_thread = threading.Thread(
+                target=self._debug_csv_worker,
+                name="policy-debug-csv",
+                daemon=True,
+            )
+            self._debug_csv_thread.start()
+            self.get_logger().info(
+                f"[DEBUG_CSV] async writer enabled queue={self.debug_csv_queue_size}"
+            )
+        # The legacy 12-rows-per-cycle schema below is retained as dead code
+        # for easy comparison during review; all active writes use the schema
+        # above and return one row per policy cycle.
+        return
         self._debug_csv_writer.writerow(
             [
                 "time",
@@ -2947,6 +2998,7 @@ class MydogPolicyNode(Node):
             if now - self._last_debug_csv_time < self.debug_csv_period_sec:
                 return
         self._last_debug_csv_time = now
+        self._csv_cycle_sequence += 1
 
         kwargs = dict(kwargs)
         kwargs["timing_info"] = self.make_debug_timing_info()
@@ -2999,6 +3051,56 @@ class MydogPolicyNode(Node):
     ):
         if self._debug_csv_writer is None:
             return
+
+        # Active cycle schema: exactly one CSV row for each policy invocation.
+        # Keep all values in the control-loop snapshot, including the send
+        # timestamps captured by send_motion_batch().
+        now = time.time() if record_time is None else float(record_time)
+        q_des = np.asarray(q_des, dtype=np.float32).reshape(12)
+        q_raw_des = q_des if q_raw_des is None else np.asarray(q_raw_des, dtype=np.float32).reshape(12)
+        current_q = np.asarray(current_q, dtype=np.float32).reshape(12)
+        current_dq = np.zeros(12, dtype=np.float32) if current_dq is None else np.asarray(current_dq, dtype=np.float32).reshape(12)
+        measured_torque = np.zeros(12, dtype=np.float32) if measured_torque is None else np.asarray(measured_torque, dtype=np.float32).reshape(12)
+        motor_online = np.zeros(12, dtype=bool) if motor_online is None else np.asarray(motor_online, dtype=bool).reshape(12)
+        motor_error_code = np.zeros(12, dtype=np.int32) if motor_error_code is None else np.asarray(motor_error_code, dtype=np.int32).reshape(12)
+        torque_limit_info = {} if torque_limit_info is None else torque_limit_info
+        timing_info = self.make_debug_timing_info() if timing_info is None else timing_info
+
+        def vec(info, key, default):
+            value = np.asarray(info.get(key, default), dtype=np.float32)
+            if value.shape == ():
+                value = np.full(12, float(value), dtype=np.float32)
+            return value.reshape(12)
+
+        raw_pd_torque = self.send_kp_real * (q_raw_des - current_q) - self.send_kd_real * current_dq
+        limited_torque = vec(torque_limit_info, "tau_safe_signed", np.zeros(12, dtype=np.float32))
+        torque_limited = np.asarray(
+            torque_limit_info.get("limited_mask", np.zeros(12, dtype=bool)), dtype=bool
+        ).reshape(12)
+        phase = float(getattr(getattr(self, "obs_builder", None), "last_gait_phase", 0.0))
+        row = [
+            f"{now:.6f}", self._csv_cycle_sequence, f"{phase:.6f}",
+            f"{float(self.cmd[0]):.6f}", f"{float(self.cmd[1]):.6f}", f"{float(self.cmd[2]):.6f}",
+            f"{float(timing_info.get('policy_loop_hz', 0.0)):.3f}",
+            f"{float(timing_info.get('state_age_ms', max_age)):.3f}",
+            self._last_send_start_time, self._last_send_end_time,
+            self._last_board_a_send_time, self._last_board_b_send_time,
+            self._last_command_sequence,
+        ]
+        for i in range(12):
+            row.extend([
+                f"{float(q_raw_des[i]):.6f}", f"{float(q_des[i]):.6f}",
+                f"{float(current_q[i]):.6f}", f"{float(current_dq[i]):.6f}",
+                f"{float(raw_pd_torque[i]):.6f}", f"{float(limited_torque[i]):.6f}",
+                f"{float(measured_torque[i]):.6f}", int(torque_limited[i]),
+                int(motor_online[i]), int(motor_error_code[i] != 0),
+            ])
+        self._debug_csv_writer.writerow(row)
+        self._debug_csv_rows_since_flush += 1
+        if self._debug_csv_rows_since_flush >= self.debug_csv_flush_every_n:
+            self._debug_csv_file.flush()
+            self._debug_csv_rows_since_flush = 0
+        return
 
         now = time.time() if record_time is None else float(record_time)
 

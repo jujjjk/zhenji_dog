@@ -414,30 +414,6 @@ class MydogPolicyParityNode(MydogPolicyNode):
             self.publish_array(self.pub_action_raw, action_raw)
             self.publish_array(self.pub_action, filtered_action)
             self.publish_array(self.pub_target, target_real)
-            self.maybe_write_policy_csv(
-                obs=obs,
-                action_raw=action_raw,
-                action_policy_obs=filtered_action,
-                action=filtered_action,
-                q_des=target_real,
-                current_q=current_q,
-                current_dq=current_dq,
-                error=error,
-                max_age=max_age,
-                measured_torque=info.get("torque_real"),
-                motor_temp=info.get("temp_real"),
-                motor_online=info.get("online"),
-                motor_error_code=info.get("error_code"),
-                motor_age_ms=info.get("age_ms"),
-                q_raw_des=target_real_raw,
-                q_smooth_des=target_real_raw,
-                motor_vel_cmd=motor_vel_cmd,
-                smoothing_info=pre_limit_info,
-                torque_limit_info=torque_limit_info,
-                cpg_action_info=cpg_action_info,
-                mode="pure_rl_pd_equivalent",
-            )
-
             if self._control_summary_log_due():
                 tau_raw = np.asarray(
                     torque_limit_info["tau_raw_signed"], dtype=np.float32
@@ -482,6 +458,32 @@ class MydogPolicyParityNode(MydogPolicyNode):
                     self.get_logger().warn(
                         "[PARITY][SAFE] /cmd_vel missing or stale; target not sent"
                     )
+
+            # Write after the send attempt so communication timestamps and
+            # command_sequence belong to this exact policy cycle.
+            self.maybe_write_policy_csv(
+                obs=obs,
+                action_raw=action_raw,
+                action_policy_obs=filtered_action,
+                action=filtered_action,
+                q_des=target_real,
+                current_q=current_q,
+                current_dq=current_dq,
+                error=error,
+                max_age=max_age,
+                measured_torque=info.get("torque_real"),
+                motor_temp=info.get("temp_real"),
+                motor_online=info.get("online"),
+                motor_error_code=info.get("error_code"),
+                motor_age_ms=info.get("age_ms"),
+                q_raw_des=target_real_raw,
+                q_smooth_des=target_real_raw,
+                motor_vel_cmd=motor_vel_cmd,
+                smoothing_info=pre_limit_info,
+                torque_limit_info=torque_limit_info,
+                cpg_action_info=cpg_action_info,
+                mode="pure_rl_pd_equivalent",
+            )
 
             # Training observation uses the action that actually passed through
             # the policy-action filter, not the actor output and not q_safe.

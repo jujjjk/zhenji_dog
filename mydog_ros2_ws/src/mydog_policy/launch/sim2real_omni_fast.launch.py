@@ -67,7 +67,9 @@ def generate_launch_description():
             "calf_target_rate_mul": "3.0",
             "calf_target_accel_mul": "3.0",
             "debug_csv_path": LaunchConfiguration("debug_csv_path"),
-            "debug_csv_period_sec": "0.1",
+            # 0 means no logger-side decimation: one row for every 50 Hz
+            # policy cycle (20 ms nominal period).
+            "debug_csv_period_sec": "0.0",
             "expected_policy_task": MODEL_TASK,
             "expected_policy_sha256": MODEL_SHA256,
         }.items(),
