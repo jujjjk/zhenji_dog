@@ -28,7 +28,10 @@ setup(
     entry_points={
         'console_scripts': [
             'mydog_policy_node = mydog_policy.mydog_policy_node:main',
-            'mydog_state_estimator_node = mydog_policy.state_estimator_node:main',
+            'mydog_check_5100_start_pose = mydog_policy.check_5100_start_pose:main',
+            # Hardened wrapper keeps the executable name unchanged, so existing
+            # launch files do not need to change.
+            'mydog_state_estimator_node = mydog_policy.state_estimator_fixed_node:main',
             'mydog_openloop_gait_node = mydog_policy.openloop_gait_node:main',
             'fanfan_ik_gait_node = mydog_policy.fanfan_ik_gait_node:main',
             'fanfan_step_in_place_node = mydog_policy.fanfan_step_in_place_node:main',
@@ -40,7 +43,8 @@ setup(
             'mydog_validate_omni_yaw_clean = mydog_policy.validate_omni_fast:main',
             'mydog_omni_fast_command = mydog_policy.omni_fast_command:main',
             'mydog_omni_yaw_clean_command = mydog_policy.omni_fast_command:main',
-            'mydog_policy_parity_node = mydog_policy.sim2real_parity_node:main',
+            # Repoint the existing parity executable to the transactional fixed node.
+            'mydog_policy_parity_node = mydog_policy.sim2real_parity_fixed_node:main',
         ],
     },
 )
