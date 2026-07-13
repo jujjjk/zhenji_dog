@@ -97,7 +97,7 @@ def generate_launch_description():
 
             "debug_print_arrays": LaunchConfiguration("debug_print_arrays"),
             "debug_csv_path": LaunchConfiguration("debug_csv_path"),
-            "debug_csv_period_sec": 0.1,
+            "debug_csv_period_sec": 0.0,
             "debug_csv_async": True,
             "debug_csv_queue_size": 128,
             "debug_csv_flush_every_n": 20,

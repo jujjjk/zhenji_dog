@@ -403,11 +403,40 @@ class MydogPolicyParityNode(MydogPolicyNode):
                 torque_budget_nm,
             )
             motor_vel_cmd = np.zeros(12, dtype=np.float32)
-            target_real, torque_limit_info = self._apply_pd_equivalent_limit(
-                target_real_raw,
-                current_q,
-                current_dq,
-            )
+
+            if self.enable_send:
+                # Normal deployment path: retain the complete PD-equivalent
+                # limiter and mechanical-joint-limit consistency check.
+                target_real, torque_limit_info = self._apply_pd_equivalent_limit(
+                    target_real_raw,
+                    current_q,
+                    current_dq,
+                )
+            else:
+                # Target-only diagnostic path:
+                # calculate the same signed PD torque clipping for CSV preview,
+                # but do not let the post-conversion mechanical clamp abort the
+                # policy cycle. Nothing from this branch is sent to the motors.
+                active_limits = self._active_torque_limits_real()
+                target_real, torque_limit_info = (
+                    self.contract_torque_limiter.limit(
+                        q_raw=target_real_raw,
+                        q_current=current_q,
+                        dq_current=current_dq,
+                        kp=self.send_kp_real,
+                        kd=self.send_kd_real,
+                        torque_limits=active_limits,
+                        qd_target=np.zeros(12, dtype=np.float32),
+                        torque_ff=np.zeros(12, dtype=np.float32),
+                    )
+                )
+                torque_limit_info["joint_limit_adjusted_mask"] = np.zeros(
+                    12, dtype=bool
+                )
+                torque_limit_info["protection_mode"] = (
+                    "pd_equivalent_preview_no_send"
+                )
+
             error = target_real - current_q
 
             self.publish_array(self.pub_obs, obs)
