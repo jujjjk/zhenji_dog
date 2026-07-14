@@ -310,6 +310,13 @@ class MydogPolicyParityNode(MydogPolicyNode):
             info["tau_reconstructed_signed"] = tau_after_clamp.astype(np.float32)
             info["tau_final_signed"] = tau_after_clamp.astype(np.float32)
         info["joint_limit_adjusted_mask"] = joint_limit_mask
+        info["rear_torque_boost_active"] = bool(
+            getattr(self, "_rear_torque_boost_active", lambda: False)()
+        )
+        info["rear_torque_boost_elapsed_s"] = float(
+            getattr(self, "_rear_torque_boost_elapsed", lambda: 0.0)()
+        )
+        info["rear_torque_limit_nm"] = float(np.max(limits[6:12]))
         info["protection_mode"] = "pd_torque_saturation_with_ff"
         return q_safe.astype(np.float32), info
 

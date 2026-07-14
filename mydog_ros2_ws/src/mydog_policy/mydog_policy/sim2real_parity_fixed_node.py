@@ -96,6 +96,9 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             "projected_gravity_y",
             "projected_gravity_z",
             "tilt_rad",
+            "rear_torque_boost_active",
+            "rear_torque_boost_elapsed_s",
+            "rear_torque_limit_nm",
         ]
         for name in policy_names:
             safe = str(name).replace("-", "_").replace(" ", "_")
@@ -174,6 +177,18 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             self.declare_parameter("enable_command_timeout_stand_hold", False)
         if not self.has_parameter("max_tilt_rad"):
             self.declare_parameter("max_tilt_rad", 0.75)
+        if not self.has_parameter("enable_rear_torque_boost"):
+            self.declare_parameter("enable_rear_torque_boost", False)
+        if not self.has_parameter("rear_torque_boost_nm"):
+            self.declare_parameter("rear_torque_boost_nm", 17.0)
+        if not self.has_parameter("rear_torque_boost_duration_sec"):
+            self.declare_parameter("rear_torque_boost_duration_sec", 2.5)
+        if not self.has_parameter("rear_torque_boost_tilt_threshold_rad"):
+            self.declare_parameter("rear_torque_boost_tilt_threshold_rad", 0.10)
+        if not self.has_parameter("rear_torque_boost_q_error_rad"):
+            self.declare_parameter("rear_torque_boost_q_error_rad", 0.12)
+        if not self.has_parameter("rear_torque_boost_overload_margin_nm"):
+            self.declare_parameter("rear_torque_boost_overload_margin_nm", 1.0)
         self.enable_tilt_protection = bool(
             self.get_parameter("enable_tilt_protection").value
         )
@@ -187,6 +202,58 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             or self.max_tilt_rad >= 1.57
         ):
             raise RuntimeError("max_tilt_rad must be finite and in (0, pi/2)")
+
+        self.enable_rear_torque_boost = bool(
+            self.get_parameter("enable_rear_torque_boost").value
+        )
+        self.rear_torque_boost_nm = float(
+            self.get_parameter("rear_torque_boost_nm").value
+        )
+        self.rear_torque_boost_duration_sec = float(
+            self.get_parameter("rear_torque_boost_duration_sec").value
+        )
+        self.rear_torque_boost_tilt_threshold_rad = float(
+            self.get_parameter("rear_torque_boost_tilt_threshold_rad").value
+        )
+        self.rear_torque_boost_q_error_rad = float(
+            self.get_parameter("rear_torque_boost_q_error_rad").value
+        )
+        self.rear_torque_boost_overload_margin_nm = float(
+            self.get_parameter("rear_torque_boost_overload_margin_nm").value
+        )
+        if (
+            not np.isfinite(self.rear_torque_boost_nm)
+            or self.rear_torque_boost_nm <= 0.0
+            or self.rear_torque_boost_nm > self.motion_torque_ff_limit_nm
+        ):
+            raise RuntimeError(
+                "rear_torque_boost_nm must be in (0, motion_torque_ff_limit_nm]"
+            )
+        if (
+            not np.isfinite(self.rear_torque_boost_duration_sec)
+            or self.rear_torque_boost_duration_sec <= 0.0
+        ):
+            raise RuntimeError("rear_torque_boost_duration_sec must be positive")
+        if (
+            not np.isfinite(self.rear_torque_boost_tilt_threshold_rad)
+            or self.rear_torque_boost_tilt_threshold_rad <= 0.0
+            or self.rear_torque_boost_tilt_threshold_rad >= self.max_tilt_rad
+        ):
+            raise RuntimeError(
+                "rear_torque_boost_tilt_threshold_rad must be in (0, max_tilt_rad)"
+            )
+        if (
+            not np.isfinite(self.rear_torque_boost_q_error_rad)
+            or self.rear_torque_boost_q_error_rad <= 0.0
+            or not np.isfinite(self.rear_torque_boost_overload_margin_nm)
+            or self.rear_torque_boost_overload_margin_nm < 0.0
+        ):
+            raise RuntimeError("rear torque boost trigger thresholds are invalid")
+
+        self._rear_torque_boost_until = 0.0
+        self._rear_torque_boost_used = False
+        self._rear_torque_boost_reason = ""
+        self._rear_torque_boost_started_at = 0.0
 
         self._install_state_capture_hooks()
 
@@ -218,6 +285,94 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
                 "unchanged; extra timeout stand hold is "
                 f"{self.enable_command_timeout_stand_hold}."
             )
+            if self.enable_rear_torque_boost:
+                self.get_logger().warn(
+                    "[PARITY_FIXED][TORQUE_BOOST] rear legs may use "
+                    f"{self.rear_torque_boost_nm:.1f} Nm for "
+                    f"{self.rear_torque_boost_duration_sec:.2f} s after a "
+                    "rear overload/tilt trigger; normal limits remain 10/10/13 Nm."
+                )
+
+    def _reset_rear_torque_boost_window(self) -> None:
+        self._rear_torque_boost_until = 0.0
+        self._rear_torque_boost_used = False
+        self._rear_torque_boost_reason = ""
+        self._rear_torque_boost_started_at = 0.0
+
+    def _rear_torque_boost_active(self) -> bool:
+        return bool(
+            self.enable_rear_torque_boost
+            and time.monotonic() < self._rear_torque_boost_until
+        )
+
+    def _rear_torque_boost_elapsed(self) -> float:
+        if not self._rear_torque_boost_active():
+            return 0.0
+        return max(0.0, time.monotonic() - self._rear_torque_boost_started_at)
+
+    def _active_torque_limits_real(self) -> np.ndarray:
+        limits = super()._active_torque_limits_real()
+        if self._rear_torque_boost_active():
+            # Real motor order is FR, FL, RL, RR. The short boost applies only
+            # to the six rear joints; front joints stay at the model limits.
+            limits[6:12] = np.float32(self.rear_torque_boost_nm)
+        return limits.astype(np.float32)
+
+    def _maybe_activate_rear_torque_boost(
+        self,
+        target_real_raw: np.ndarray,
+        current_q: np.ndarray,
+        current_dq: np.ndarray,
+        tilt_rad: float,
+    ) -> None:
+        if not self.enable_rear_torque_boost:
+            return
+        if self._rear_torque_boost_active() or self._rear_torque_boost_used:
+            return
+        if self.zero_cmd_stand_active():
+            return
+
+        target_real_raw = np.asarray(target_real_raw, dtype=np.float32).reshape(12)
+        current_q = np.asarray(current_q, dtype=np.float32).reshape(12)
+        current_dq = np.asarray(current_dq, dtype=np.float32).reshape(12)
+        rear = np.arange(6, 12, dtype=np.int64)
+        rear_calf = np.asarray([8, 11], dtype=np.int64)
+        nominal_limits = np.asarray(
+            self.contract_torque_limits_real,
+            dtype=np.float32,
+        ).reshape(12)
+        tau_raw = (
+            self.send_kp_real * (target_real_raw - current_q)
+            - self.send_kd_real * current_dq
+            + float(self.send_torque)
+        )
+        rear_overload = float(
+            np.max(np.abs(tau_raw[rear]) - nominal_limits[rear])
+        )
+        rear_q_error = float(
+            np.max(np.abs(target_real_raw[rear_calf] - current_q[rear_calf]))
+        )
+        trigger = []
+        if rear_overload >= self.rear_torque_boost_overload_margin_nm:
+            trigger.append(f"rear_tau_over={rear_overload:.2f}Nm")
+        if rear_q_error >= self.rear_torque_boost_q_error_rad:
+            trigger.append(f"rear_calf_qerr={rear_q_error:.3f}rad")
+        if np.isfinite(tilt_rad) and tilt_rad >= self.rear_torque_boost_tilt_threshold_rad:
+            trigger.append(f"tilt={tilt_rad:.3f}rad")
+        if not trigger:
+            return
+
+        now = time.monotonic()
+        self._rear_torque_boost_started_at = now
+        self._rear_torque_boost_until = now + self.rear_torque_boost_duration_sec
+        self._rear_torque_boost_used = True
+        self._rear_torque_boost_reason = ",".join(trigger)
+        self.get_logger().warn(
+            "[PARITY_FIXED][TORQUE_BOOST] activated | "
+            f"limit={self.rear_torque_boost_nm:.1f}Nm "
+            f"duration={self.rear_torque_boost_duration_sec:.2f}s "
+            f"reason={self._rear_torque_boost_reason}"
+        )
 
     @staticmethod
     def _tilt_from_observation(obs: np.ndarray) -> float:
@@ -779,6 +934,9 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             f"{float(gravity[1]):.6f}",
             f"{float(gravity[2]):.6f}",
             f"{self._tilt_from_observation(obs_flat):.6f}",
+            int(bool(torque_limit_info.get("rear_torque_boost_active", False))),
+            f"{float(torque_limit_info.get('rear_torque_boost_elapsed_s', 0.0)):.6f}",
+            f"{float(torque_limit_info.get('rear_torque_limit_nm', 0.0)):.6f}",
         ]
         for i in range(12):
             row.extend(
@@ -954,6 +1112,16 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             )
             motor_vel_cmd = np.zeros(12, dtype=np.float32)
 
+            if zero_cmd_stand:
+                self._reset_rear_torque_boost_window()
+            else:
+                self._maybe_activate_rear_torque_boost(
+                    target_real_raw,
+                    current_q,
+                    current_dq,
+                    tilt_rad,
+                )
+
             if self.enable_send:
                 target_real, torque_limit_info = self._apply_pd_equivalent_limit(
                     target_real_raw,
@@ -975,6 +1143,15 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
                 )
                 torque_limit_info["joint_limit_adjusted_mask"] = np.zeros(
                     12, dtype=bool
+                )
+                torque_limit_info["rear_torque_boost_active"] = bool(
+                    self._rear_torque_boost_active()
+                )
+                torque_limit_info["rear_torque_boost_elapsed_s"] = float(
+                    self._rear_torque_boost_elapsed()
+                )
+                torque_limit_info["rear_torque_limit_nm"] = float(
+                    np.max(active_limits[6:12])
                 )
                 torque_limit_info["protection_mode"] = "pd_equivalent_preview_no_send"
 

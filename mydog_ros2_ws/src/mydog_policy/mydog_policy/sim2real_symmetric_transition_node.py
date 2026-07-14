@@ -237,6 +237,7 @@ class MydogSymmetricTransition5530Node(MydogPolicyParityFixedNode):
         if not was_fresh:
             # A genuinely new command stream is a new deployment episode.
             self._reset_contract_state(reset_phase=True)
+            self._reset_rear_torque_boost_window()
             self._reset_heading_target_to_current_yaw("fresh_command_stream")
             self._last_transition_anchor_cmd = new_target
             return
@@ -244,11 +245,13 @@ class MydogSymmetricTransition5530Node(MydogPolicyParityFixedNode):
         if self._is_significant_transition(previous_anchor, new_target):
             # Match Gym resampling: re-anchor desired heading, but preserve gait
             # phase, previous action and the action-filter state.
+            self._reset_rear_torque_boost_window()
             self._reset_heading_target_to_current_yaw("command_transition")
             self._last_transition_anchor_cmd = new_target
 
     def finish_startup_stand(self, current_real):
         super().finish_startup_stand(current_real)
+        self._reset_rear_torque_boost_window()
         self._reset_heading_target_to_current_yaw(
             "startup_stand_complete"
         )

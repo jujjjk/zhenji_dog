@@ -159,6 +159,33 @@ def test_symmetric_transition_launch_exposes_torque_ff_protocol_limit():
     assert 'default_value="17.0"' in source
 
 
+def test_symmetric_transition_launch_enables_short_rear_torque_recovery():
+    launch_file = (
+        Path(__file__).parents[1]
+        / "launch"
+        / "sim2real_symmetric_transition_5530.launch.py"
+    )
+    source = launch_file.read_text(encoding="utf-8")
+    assert '"enable_rear_torque_boost": LaunchConfiguration(' in source
+    assert '"rear_torque_boost_nm": LaunchConfiguration(' in source
+    assert '"rear_torque_boost_duration_sec": LaunchConfiguration(' in source
+    assert '"enable_rear_torque_boost",' in source
+    assert '"rear_torque_boost_nm",' in source
+    assert 'default_value="2.5"' in source
+
+
+def test_rear_torque_boost_changes_only_real_rear_limits():
+    node_file = (
+        Path(__file__).parents[1]
+        / "mydog_policy"
+        / "sim2real_parity_fixed_node.py"
+    )
+    source = node_file.read_text(encoding="utf-8")
+    assert "limits[6:12]" in source
+    assert "_maybe_activate_rear_torque_boost" in source
+    assert "_rear_torque_boost_used" in source
+
+
 def test_parity_node_applies_only_explicit_gait_period_scaling():
     node_file = (
         Path(__file__).parents[1]

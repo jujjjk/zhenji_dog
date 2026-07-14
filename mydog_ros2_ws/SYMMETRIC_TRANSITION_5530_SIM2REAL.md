@@ -60,7 +60,7 @@ ros2 run mydog_policy mydog_symmetric_transition_command \
 
 ```bash
 ros2 run mydog_policy mydog_symmetric_transition_command \
-  --profile fast --action backward --rate 20
+  --profile fast --action left_yaw --rate 20
 ```
 
 单独动作不指定 `--segment-sec` 时会持续运行，按 Ctrl+C 停止；发布器退出前会自动连续发送零指令。

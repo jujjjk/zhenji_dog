@@ -136,6 +136,24 @@ def generate_launch_description():
             "motion_torque_ff_limit_nm": LaunchConfiguration(
                 "motion_torque_ff_limit_nm"
             ),
+            "enable_rear_torque_boost": LaunchConfiguration(
+                "enable_rear_torque_boost"
+            ),
+            "rear_torque_boost_nm": LaunchConfiguration(
+                "rear_torque_boost_nm"
+            ),
+            "rear_torque_boost_duration_sec": LaunchConfiguration(
+                "rear_torque_boost_duration_sec"
+            ),
+            "rear_torque_boost_tilt_threshold_rad": LaunchConfiguration(
+                "rear_torque_boost_tilt_threshold_rad"
+            ),
+            "rear_torque_boost_q_error_rad": LaunchConfiguration(
+                "rear_torque_boost_q_error_rad"
+            ),
+            "rear_torque_boost_overload_margin_nm": LaunchConfiguration(
+                "rear_torque_boost_overload_margin_nm"
+            ),
             "enable_rear_leg_posture_bias": False,
 
             "debug_print_arrays": LaunchConfiguration(
@@ -184,6 +202,30 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "motion_torque_ff_limit_nm",
             default_value="17.0",
+        ),
+        DeclareLaunchArgument(
+            "enable_rear_torque_boost",
+            default_value="true",
+        ),
+        DeclareLaunchArgument(
+            "rear_torque_boost_nm",
+            default_value="17.0",
+        ),
+        DeclareLaunchArgument(
+            "rear_torque_boost_duration_sec",
+            default_value="2.5",
+        ),
+        DeclareLaunchArgument(
+            "rear_torque_boost_tilt_threshold_rad",
+            default_value="0.10",
+        ),
+        DeclareLaunchArgument(
+            "rear_torque_boost_q_error_rad",
+            default_value="0.12",
+        ),
+        DeclareLaunchArgument(
+            "rear_torque_boost_overload_margin_nm",
+            default_value="1.0",
         ),
         DeclareLaunchArgument(
             "enable_tilt_protection",
