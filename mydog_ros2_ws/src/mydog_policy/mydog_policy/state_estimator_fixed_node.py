@@ -17,8 +17,10 @@ class MydogStateEstimatorFixedNode(MydogStateEstimatorNode):
 
     def __init__(self):
         super().__init__()
+
         if not self.has_parameter("no_stance_velocity_decay"):
             self.declare_parameter("no_stance_velocity_decay", 0.85)
+
         self.no_stance_velocity_decay = float(
             np.clip(
                 float(self.get_parameter("no_stance_velocity_decay").value),
@@ -26,38 +28,49 @@ class MydogStateEstimatorFixedNode(MydogStateEstimatorNode):
                 1.0,
             )
         )
+
         self.get_logger().warn(
             "[STATE_FIXED] no-stance velocity decay enabled: "
-            f"factor={self.no_stance_velocity_decay:.3f}; publishing motor snapshot metadata"
+            f"factor={self.no_stance_velocity_decay:.3f}; "
+            "publishing motor snapshot metadata"
         )
 
     def update(self):
         try:
             motor = self.motor.get_latest()
             if not motor.valid:
-                self.get_logger().warn("Motor state invalid. Skip estimator frame.")
+                self.get_logger().warn(
+                    "Motor state invalid. Skip estimator frame."
+                )
                 return
 
             max_age = float(np.max(motor.age_ms))
             if max_age > self.max_motor_age_ms:
                 self.get_logger().warn(
                     f"Motor feedback too old: max_age={max_age:.1f} ms "
-                    f"> {self.max_motor_age_ms:.1f} ms. Skip estimator frame."
+                    f"> {self.max_motor_age_ms:.1f} ms. "
+                    "Skip estimator frame."
                 )
                 return
 
             if self.require_online and not np.all(motor.online):
-                self.get_logger().warn("Some motors offline. Skip estimator frame.")
+                self.get_logger().warn(
+                    "Some motors offline. Skip estimator frame."
+                )
                 return
 
             imu = self.imu.get_latest()
             if not imu.valid:
-                self.get_logger().warn("IMU invalid. Skip estimator frame.")
+                self.get_logger().warn(
+                    "IMU invalid. Skip estimator frame."
+                )
                 return
 
-            q_abs_policy, dq_policy = self.mapper.real_to_policy_abs_q_dq(
-                motor.q_real,
-                motor.dq_real,
+            q_abs_policy, dq_policy = (
+                self.mapper.real_to_policy_abs_q_dq(
+                    motor.q_real,
+                    motor.dq_real,
+                )
             )
 
             result = self.estimator.estimate(
@@ -66,35 +79,64 @@ class MydogStateEstimatorFixedNode(MydogStateEstimatorNode):
                 omega_body=imu.gyro_rad_s,
             )
 
-            # Original behavior holds the last velocity forever when no stance
-            # candidate exists.  Exponential decay prevents a stale "ghost"
-            # velocity from being fed back to the policy.
+            # 原始估计器在无支撑腿时会一直保持上一帧速度。
+            # 这里进行指数衰减，避免旧速度持续进入策略观测。
             if result.confidence <= 0.0:
                 self.estimator.filtered *= self.no_stance_velocity_decay
                 self.estimator.last_raw = self.estimator.filtered.copy()
+
                 self.estimator.filtered[2] = 0.0
                 self.estimator.last_raw[2] = 0.0
-                result.base_lin_vel = self.estimator.filtered.astype(np.float32).copy()
-                result.raw_base_lin_vel = self.estimator.last_raw.astype(np.float32).copy()
 
-            self.publish_array(self.pub_base_lin_vel, result.base_lin_vel)
+                result.base_lin_vel = (
+                    self.estimator.filtered.astype(np.float32).copy()
+                )
+                result.raw_base_lin_vel = (
+                    self.estimator.last_raw.astype(np.float32).copy()
+                )
 
-            seq = np.asarray(motor.snapshot_seq, dtype=np.int64).reshape(12)
-            tick = np.asarray(motor.board_tick_ms, dtype=np.int64).reshape(12)
+            self.publish_array(
+                self.pub_base_lin_vel,
+                result.base_lin_vel,
+            )
+
+            seq = np.asarray(
+                motor.snapshot_seq,
+                dtype=np.int64,
+            ).reshape(12)
+            tick = np.asarray(
+                motor.board_tick_ms,
+                dtype=np.int64,
+            ).reshape(12)
+
             seq_a = int(seq[0]) & 0xFFFF
             seq_b = int(seq[6]) & 0xFFFF
             tick_a = int(tick[0])
             tick_b = int(tick[6])
 
-            # First ten values preserve the legacy message contract.  The extra
-            # seven values are ignored by old consumers and used by the fixed
-            # parity node to detect estimator/motor frame skew.
+            # 前10项保持旧版消息兼容：
+            # 0:3  base_lin_vel
+            # 3:6  gyro
+            # 6:9  projected_gravity
+            # 9    yaw
+            #
+            # 后7项供 parity-fixed 判断估计器与电机帧是否同步：
+            # 10   confidence
+            # 11   cache_age_ms
+            # 12   seq_a
+            # 13   seq_b
+            # 14   tick_a_ms
+            # 15   tick_b_ms
+            # 16   max_motor_age_ms
             state = np.concatenate(
                 [
                     result.base_lin_vel,
                     imu.gyro_rad_s.astype(np.float32),
                     imu.projected_gravity.astype(np.float32),
-                    np.array([np.deg2rad(imu.rpy_deg[2])], dtype=np.float32),
+                    np.array(
+                        [np.deg2rad(imu.rpy_deg[2])],
+                        dtype=np.float32,
+                    ),
                     np.array(
                         [
                             result.confidence,
@@ -140,21 +182,27 @@ class MydogStateEstimatorFixedNode(MydogStateEstimatorNode):
                     f"stance={result.stance_mask.astype(int).tolist()} "
                     f"height={np.array2string(result.foot_height, precision=3)} "
                     f"conf={result.confidence:.2f} "
-                    f"seqA/B={seq_a}/{seq_b} max_age={max_age:.1f}ms"
+                    f"seqA/B={seq_a}/{seq_b} "
+                    f"max_age={max_age:.1f}ms"
                 )
 
         except Exception as exc:
-            self.get_logger().error(f"fixed state estimator error: {exc}")
+            self.get_logger().error(
+                f"fixed state estimator error: {exc}"
+            )
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = MydogStateEstimatorFixedNode()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+
     node.destroy_node()
+
     try:
         rclpy.shutdown()
     except Exception:

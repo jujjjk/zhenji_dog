@@ -2,49 +2,62 @@ from glob import glob
 
 from setuptools import find_packages, setup
 
-package_name = 'mydog_policy'
+package_name = "mydog_policy"
 
 setup(
     name=package_name,
-    version='0.0.0',
-    packages=find_packages(exclude=['test']),
+    version="0.0.0",
+    packages=find_packages(exclude=["test"]),
     data_files=[
-        ('share/ament_index/resource_index/packages',
-            ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
+        (
+            "share/ament_index/resource_index/packages",
+            ["resource/" + package_name],
+        ),
+        (
+            "share/" + package_name,
+            ["package.xml"],
+        ),
+        (
+            "share/" + package_name + "/launch",
+            glob("launch/*.launch.py"),
+        ),
     ],
-    install_requires=['setuptools'],
+    install_requires=["setuptools"],
     zip_safe=True,
-    maintainer='jetson',
-    maintainer_email='jetson@todo.todo',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    maintainer="jetson",
+    maintainer_email="jetson@todo.todo",
+    description="Fanfan quadruped robot policy deployment package",
+    license="Apache-2.0",
     extras_require={
-        'test': [
-            'pytest',
+        "test": [
+            "pytest",
         ],
     },
     entry_points={
-        'console_scripts': [
-            'mydog_policy_node = mydog_policy.mydog_policy_node:main',
-            'mydog_check_5100_start_pose = mydog_policy.check_5100_start_pose:main',
-            # Hardened wrapper keeps the executable name unchanged, so existing
-            # launch files do not need to change.
-            'mydog_state_estimator_node = mydog_policy.state_estimator_fixed_node:main',
-            'mydog_openloop_gait_node = mydog_policy.openloop_gait_node:main',
-            'fanfan_ik_gait_node = mydog_policy.fanfan_ik_gait_node:main',
-            'fanfan_step_in_place_node = mydog_policy.fanfan_step_in_place_node:main',
-            'fanfan_cpg_vmc_v4_node = mydog_policy.fanfan_cpg_vmc_v4_node:main',
-            'fanfan_cpg_vmc_v4_migration_node = mydog_policy.fanfan_cpg_vmc_v4_migration_node:main',
-            'mydog_soft_body_gait_node = mydog_policy.openloop_gait_node_soft_body_urdf:main',
-            'mydog_joint_semantic_test_node = mydog_policy.joint_semantic_test_node:main',
-            'mydog_validate_omni_fast = mydog_policy.validate_omni_fast:main',
-            'mydog_validate_omni_yaw_clean = mydog_policy.validate_omni_fast:main',
-            'mydog_omni_fast_command = mydog_policy.omni_fast_command:main',
-            'mydog_omni_yaw_clean_command = mydog_policy.omni_fast_command:main',
-            # Repoint the existing parity executable to the transactional fixed node.
-            'mydog_policy_parity_node = mydog_policy.sim2real_parity_fixed_node:main',
+        "console_scripts": [
+            "mydog_policy_node = mydog_policy.mydog_policy_node:main",
+            "mydog_check_5100_start_pose = mydog_policy.check_5100_start_pose:main",
+            "mydog_check_force_coord_start_pose = mydog_policy.check_force_coord_start_pose:main",
+            "mydog_validate_force_coord_model = mydog_policy.validate_force_coord_model:main",
+
+            # 使用 fixed 状态估计节点，向 parity-fixed 发布扩展快照元数据。
+            "mydog_state_estimator_node = mydog_policy.state_estimator_fixed_node:main",
+
+            "mydog_openloop_gait_node = mydog_policy.openloop_gait_node:main",
+            "fanfan_ik_gait_node = mydog_policy.fanfan_ik_gait_node:main",
+            "fanfan_step_in_place_node = mydog_policy.fanfan_step_in_place_node:main",
+            "fanfan_cpg_vmc_v4_node = mydog_policy.fanfan_cpg_vmc_v4_node:main",
+            "fanfan_cpg_vmc_v4_migration_node = mydog_policy.fanfan_cpg_vmc_v4_migration_node:main",
+            "mydog_soft_body_gait_node = mydog_policy.openloop_gait_node_soft_body_urdf:main",
+            "mydog_joint_semantic_test_node = mydog_policy.joint_semantic_test_node:main",
+            "mydog_validate_omni_fast = mydog_policy.validate_omni_fast:main",
+            "mydog_validate_omni_yaw_clean = mydog_policy.validate_omni_fast:main",
+            "mydog_omni_fast_command = mydog_policy.omni_fast_command:main",
+            "mydog_omni_yaw_clean_command = mydog_policy.omni_fast_command:main",
+            "mydog_policy_parity_node = mydog_policy.sim2real_parity_fixed_node:main",
+
+            # force_coord_5280 独立真机节点。
+            "mydog_force_coord_node = mydog_policy.sim2real_force_coord_node:main",
         ],
     },
 )
