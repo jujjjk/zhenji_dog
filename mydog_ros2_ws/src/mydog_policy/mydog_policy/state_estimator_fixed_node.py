@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""State-estimator wrapper with no-stance decay and snapshot metadata."""
+"""Fixed state estimator with robust support-foot selection and snapshot metadata."""
 
 from __future__ import annotations
 
@@ -9,17 +9,24 @@ import time
 import numpy as np
 import rclpy
 
+from .leg_odometry_robust import RobustLegOdometryEstimator
 from .state_estimator_node import MydogStateEstimatorNode
 
 
 class MydogStateEstimatorFixedNode(MydogStateEstimatorNode):
-    """Harden the existing leg-odometry estimator for policy deployment."""
+    """Use robust leg odometry while retaining the existing ROS topic contract."""
 
     def __init__(self):
         super().__init__()
 
-        if not self.has_parameter("no_stance_velocity_decay"):
-            self.declare_parameter("no_stance_velocity_decay", 0.85)
+        self.declare_parameter("no_stance_velocity_decay", 0.85)
+        self.declare_parameter("robust_stance_height_margin", 0.035)
+        self.declare_parameter("robust_vertical_speed_threshold", 0.22)
+        self.declare_parameter("robust_velocity_residual_threshold", 0.30)
+        self.declare_parameter("robust_max_stance_feet", 2)
+        self.declare_parameter("robust_filter_alpha", 0.35)
+        self.declare_parameter("robust_absolute_height_guard", 0.10)
+        self.declare_parameter("robust_planar_velocity_clip", 1.0)
 
         self.no_stance_velocity_decay = float(
             np.clip(
@@ -29,10 +36,48 @@ class MydogStateEstimatorFixedNode(MydogStateEstimatorNode):
             )
         )
 
+        # Replace the original all-foot speed-gated estimator before rclpy.spin()
+        # starts invoking the timer created by the base node.
+        self.estimator = RobustLegOdometryEstimator(
+            nominal_base_height=float(
+                self.get_parameter("nominal_base_height").value
+            ),
+            foot_radius=float(self.get_parameter("foot_radius").value),
+            stance_height_margin=float(
+                self.get_parameter("robust_stance_height_margin").value
+            ),
+            stance_vertical_speed_threshold=float(
+                self.get_parameter("robust_vertical_speed_threshold").value
+            ),
+            stance_velocity_residual_threshold=float(
+                self.get_parameter(
+                    "robust_velocity_residual_threshold"
+                ).value
+            ),
+            max_stance_feet=int(
+                self.get_parameter("robust_max_stance_feet").value
+            ),
+            filter_alpha=float(
+                self.get_parameter("robust_filter_alpha").value
+            ),
+            absolute_height_guard=float(
+                self.get_parameter("robust_absolute_height_guard").value
+            ),
+            planar_velocity_clip=float(
+                self.get_parameter("robust_planar_velocity_clip").value
+            ),
+        )
+
         self.get_logger().warn(
-            "[STATE_FIXED] no-stance velocity decay enabled: "
-            f"factor={self.no_stance_velocity_decay:.3f}; "
-            "publishing motor snapshot metadata"
+            "[STATE_FIXED_ROBUST] enabled | "
+            f"height_margin={self.estimator.stance_height_margin:.3f}m, "
+            "vertical_speed_threshold="
+            f"{self.estimator.stance_vertical_speed_threshold:.3f}m/s, "
+            "velocity_residual_threshold="
+            f"{self.estimator.stance_velocity_residual_threshold:.3f}m/s, "
+            f"max_stance_feet={self.estimator.max_stance_feet}, "
+            f"filter_alpha={self.estimator.filter_alpha:.2f}, "
+            f"no_stance_decay={self.no_stance_velocity_decay:.2f}"
         )
 
     def update(self):
@@ -79,21 +124,13 @@ class MydogStateEstimatorFixedNode(MydogStateEstimatorNode):
                 omega_body=imu.gyro_rad_s,
             )
 
-            # 原始估计器在无支撑腿时会一直保持上一帧速度。
-            # 这里进行指数衰减，避免旧速度持续进入策略观测。
             if result.confidence <= 0.0:
                 self.estimator.filtered *= self.no_stance_velocity_decay
                 self.estimator.last_raw = self.estimator.filtered.copy()
-
                 self.estimator.filtered[2] = 0.0
                 self.estimator.last_raw[2] = 0.0
-
-                result.base_lin_vel = (
-                    self.estimator.filtered.astype(np.float32).copy()
-                )
-                result.raw_base_lin_vel = (
-                    self.estimator.last_raw.astype(np.float32).copy()
-                )
+                result.base_lin_vel = self.estimator.filtered.copy()
+                result.raw_base_lin_vel = self.estimator.last_raw.copy()
 
             self.publish_array(
                 self.pub_base_lin_vel,
@@ -114,20 +151,8 @@ class MydogStateEstimatorFixedNode(MydogStateEstimatorNode):
             tick_a = int(tick[0])
             tick_b = int(tick[6])
 
-            # 前10项保持旧版消息兼容：
-            # 0:3  base_lin_vel
-            # 3:6  gyro
-            # 6:9  projected_gravity
-            # 9    yaw
-            #
-            # 后7项供 parity-fixed 判断估计器与电机帧是否同步：
-            # 10   confidence
-            # 11   cache_age_ms
-            # 12   seq_a
-            # 13   seq_b
-            # 14   tick_a_ms
-            # 15   tick_b_ms
-            # 16   max_motor_age_ms
+            # 0:10 remains compatible with the original state estimator.
+            # 10:17 is consumed by sim2real_parity_fixed_node.
             state = np.concatenate(
                 [
                     result.base_lin_vel,
@@ -188,21 +213,19 @@ class MydogStateEstimatorFixedNode(MydogStateEstimatorNode):
 
         except Exception as exc:
             self.get_logger().error(
-                f"fixed state estimator error: {exc}"
+                f"robust fixed state estimator error: {exc}"
             )
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = MydogStateEstimatorFixedNode()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
 
     node.destroy_node()
-
     try:
         rclpy.shutdown()
     except Exception:
