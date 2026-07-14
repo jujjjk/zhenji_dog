@@ -45,6 +45,16 @@ class MydogPolicyParityNode(MydogPolicyNode):
         control = self.deployment_config["control"]
         self.contract_action_filter = ContractPolicyActionFilter.from_control(control)
         self.contract_torque_limiter = PDTorqueEquivalentLimiter()
+        if not self.has_parameter("motion_torque_ff_limit_nm"):
+            self.declare_parameter("motion_torque_ff_limit_nm", 17.0)
+        self.motion_torque_ff_limit_nm = float(
+            self.get_parameter("motion_torque_ff_limit_nm").value
+        )
+        if (
+            not np.isfinite(self.motion_torque_ff_limit_nm)
+            or self.motion_torque_ff_limit_nm <= 0.0
+        ):
+            raise RuntimeError("motion_torque_ff_limit_nm must be positive")
 
         torque_limits_policy = np.asarray(
             control.get("torque_limits", np.full(12, 1.0e9, dtype=np.float32)),
@@ -259,7 +269,7 @@ class MydogPolicyParityNode(MydogPolicyNode):
         limits = self._active_torque_limits_real()
         qd_target = np.zeros(12, dtype=np.float32)
         torque_ff = np.zeros(12, dtype=np.float32)
-        q_safe, info = self.contract_torque_limiter.limit(
+        q_safe, info = self.contract_torque_limiter.limit_with_torque_feedforward(
             q_raw=q_raw,
             q_current=q_current,
             dq_current=dq_current,
@@ -268,6 +278,7 @@ class MydogPolicyParityNode(MydogPolicyNode):
             torque_limits=limits,
             qd_target=qd_target,
             torque_ff=torque_ff,
+            torque_ff_limit=self.motion_torque_ff_limit_nm,
         )
 
         # Preserve the existing mechanical joint limits after the equivalent
@@ -282,9 +293,14 @@ class MydogPolicyParityNode(MydogPolicyNode):
         joint_limit_mask = np.abs(q_safe_clamped - q_safe) > 1.0e-6
         if np.any(joint_limit_mask):
             velocity_error = -np.asarray(dq_current, dtype=np.float32).reshape(12)
+            torque_ff_cmd = np.asarray(
+                info.get("torque_ff_cmd", np.zeros(12, dtype=np.float32)),
+                dtype=np.float32,
+            ).reshape(12)
             tau_after_clamp = (
                 self.send_kp_real * (q_safe_clamped - q_current)
                 + self.send_kd_real * velocity_error
+                + torque_ff_cmd
             )
             if np.any(np.abs(tau_after_clamp) > limits + 1.0e-3):
                 raise RuntimeError(
@@ -292,8 +308,9 @@ class MydogPolicyParityNode(MydogPolicyNode):
                 )
             q_safe = q_safe_clamped.astype(np.float32)
             info["tau_reconstructed_signed"] = tau_after_clamp.astype(np.float32)
+            info["tau_final_signed"] = tau_after_clamp.astype(np.float32)
         info["joint_limit_adjusted_mask"] = joint_limit_mask
-        info["protection_mode"] = "pd_equivalent"
+        info["protection_mode"] = "pd_torque_saturation_with_ff"
         return q_safe.astype(np.float32), info
 
     def control_loop(self):

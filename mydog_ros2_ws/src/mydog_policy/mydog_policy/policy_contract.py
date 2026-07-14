@@ -216,3 +216,121 @@ class PDTorqueEquivalentLimiter:
             "err_limit_min": float(np.min(np.abs(safe_delta))),
             "err_limit_max": float(np.max(np.abs(safe_delta))),
         }
+
+    def limit_with_torque_feedforward(
+        self,
+        q_raw: np.ndarray,
+        q_current: np.ndarray,
+        dq_current: np.ndarray,
+        kp: np.ndarray,
+        kd: np.ndarray,
+        torque_limits: np.ndarray | float,
+        qd_target: np.ndarray | None = None,
+        torque_ff: np.ndarray | None = None,
+        torque_ff_limit: float = 17.0,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Saturate the complete motor torque while preserving ``q_raw``.
+
+        The RS04 motion command has both a position-PD target and a torque
+        feed-forward field.  The previous parity path converted a clipped
+        torque back into a different position target.  That changes the
+        learned trajectory, especially when the derivative term is large.
+
+        This path first keeps the learned position target and uses the
+        feed-forward field to cancel the excess PD torque.  Only if the
+        protocol feed-forward range is insufficient is the position target
+        moved, and then only by the remaining amount needed to meet the
+        training torque limit.
+        """
+        q_raw = np.asarray(q_raw, dtype=np.float32).reshape(12)
+        q_current = np.asarray(q_current, dtype=np.float32).reshape(12)
+        dq_current = np.asarray(dq_current, dtype=np.float32).reshape(12)
+        kp = np.abs(np.asarray(kp, dtype=np.float32).reshape(12))
+        kd = np.abs(np.asarray(kd, dtype=np.float32).reshape(12))
+        limits = _vector(torque_limits, 12, name="torque_limits", default=1.0e9)
+        qd_target = (
+            np.zeros(12, dtype=np.float32)
+            if qd_target is None
+            else np.asarray(qd_target, dtype=np.float32).reshape(12)
+        )
+        torque_ff = (
+            np.zeros(12, dtype=np.float32)
+            if torque_ff is None
+            else np.asarray(torque_ff, dtype=np.float32).reshape(12)
+        )
+        ff_limit = float(torque_ff_limit)
+
+        for name, arr in (
+            ("q_raw", q_raw),
+            ("q_current", q_current),
+            ("dq_current", dq_current),
+            ("kp", kp),
+            ("kd", kd),
+            ("qd_target", qd_target),
+            ("torque_ff", torque_ff),
+        ):
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(f"{name} must be finite")
+        if np.any(kp <= 1.0e-6):
+            raise ValueError("kp must be positive")
+        if np.any(limits <= 0.0):
+            raise ValueError("torque_limits must be positive")
+        if not np.isfinite(ff_limit) or ff_limit <= 0.0:
+            raise ValueError("torque_ff_limit must be positive and finite")
+
+        velocity_error = qd_target - dq_current
+        pd_torque = kp * (q_raw - q_current) + kd * velocity_error
+        requested_torque = pd_torque + torque_ff
+        target_torque = np.clip(requested_torque, -limits, limits)
+
+        # Keep q_raw whenever the feed-forward channel can cancel the excess
+        # torque.  The command torque replaces, rather than adds to, the
+        # caller's nominal feed-forward value.
+        torque_ff_needed = target_torque - pd_torque
+        torque_ff_cmd = np.clip(
+            torque_ff_needed,
+            -ff_limit,
+            ff_limit,
+        ).astype(np.float32)
+        q_cmd = q_raw.copy()
+
+        # If the RS04 torque field clips before the requested total torque is
+        # reached, make the smallest possible q-target correction.  This is
+        # only the unavoidable protocol fallback; normal cycles send q_raw.
+        residual_torque = target_torque - (
+            kp * (q_cmd - q_current)
+            + kd * velocity_error
+            + torque_ff_cmd
+        )
+        q_cmd += residual_torque / kp
+
+        final_torque = (
+            kp * (q_cmd - q_current)
+            + kd * velocity_error
+            + torque_ff_cmd
+        )
+        target_adjusted_mask = np.abs(q_cmd - q_raw) > 1.0e-6
+        torque_limited_mask = np.abs(requested_torque - target_torque) > 1.0e-6
+        return q_cmd.astype(np.float32), {
+            "enabled": True,
+            "limited_count": int(np.count_nonzero(torque_limited_mask)),
+            "limited_mask": torque_limited_mask,
+            "target_adjusted_count": int(np.count_nonzero(target_adjusted_mask)),
+            "target_adjusted_mask": target_adjusted_mask,
+            "torque_budget": float(np.max(limits)),
+            "torque_limits": limits.astype(np.float32),
+            "tau_raw_signed": requested_torque.astype(np.float32),
+            "tau_pd_signed": pd_torque.astype(np.float32),
+            "tau_safe_signed": target_torque.astype(np.float32),
+            "tau_final_signed": final_torque.astype(np.float32),
+            "torque_ff_needed": torque_ff_needed.astype(np.float32),
+            "torque_ff_cmd": torque_ff_cmd.astype(np.float32),
+            "tau_reconstructed_signed": final_torque.astype(np.float32),
+            "tau_est": np.abs(final_torque).astype(np.float32),
+            "tau_est_max": float(np.max(np.abs(final_torque))),
+            "raw_delta": (q_raw - q_current).astype(np.float32),
+            "safe_delta": (q_cmd - q_current).astype(np.float32),
+            "err_limit": np.abs(q_cmd - q_current).astype(np.float32),
+            "err_limit_min": float(np.min(np.abs(q_cmd - q_current))),
+            "err_limit_max": float(np.max(np.abs(q_cmd - q_current))),
+        }

@@ -40,7 +40,6 @@ setup(
             "mydog_check_force_coord_start_pose = mydog_policy.check_force_coord_start_pose:main",
             "mydog_validate_force_coord_model = mydog_policy.validate_force_coord_model:main",
 
-            # 使用 fixed 状态估计节点，向 parity-fixed 发布扩展快照元数据。
             "mydog_state_estimator_node = mydog_policy.state_estimator_fixed_node:main",
 
             "mydog_openloop_gait_node = mydog_policy.openloop_gait_node:main",
@@ -56,8 +55,12 @@ setup(
             "mydog_omni_yaw_clean_command = mydog_policy.omni_fast_command:main",
             "mydog_policy_parity_node = mydog_policy.sim2real_parity_fixed_node:main",
 
-            # force_coord_5280 独立真机节点。
             "mydog_force_coord_node = mydog_policy.sim2real_force_coord_node:main",
+
+            # Symmetric-transition checkpoint 5530 deployment.
+            "mydog_symmetric_transition_node = mydog_policy.sim2real_symmetric_transition_node:main",
+            "mydog_validate_symmetric_transition_model = mydog_policy.validate_symmetric_transition_model:main",
+            "mydog_symmetric_transition_command = mydog_policy.symmetric_transition_command:main",
         ],
     },
 )

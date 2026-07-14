@@ -92,6 +92,10 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             "server_total_ms",
             "num_spi_frames",
             "batch_active",
+            "projected_gravity_x",
+            "projected_gravity_y",
+            "projected_gravity_z",
+            "tilt_rad",
         ]
         for name in policy_names:
             safe = str(name).replace("-", "_").replace(" ", "_")
@@ -112,6 +116,7 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
                     f"{safe}_dq_current",
                     f"{safe}_raw_pd_torque",
                     f"{safe}_limited_torque",
+                    f"{safe}_command_torque_ff",
                     f"{safe}_feedback_torque",
                     f"{safe}_torque_limited_flag",
                     f"{safe}_motor_online",
@@ -160,6 +165,28 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
         self._consecutive_send_failures = 0
         self._last_send_meta = self._empty_send_meta()
         self._last_estimator_sync_warn = 0.0
+        self._stale_command_hold_active = False
+        self._tilt_protection_active = False
+
+        if not self.has_parameter("enable_tilt_protection"):
+            self.declare_parameter("enable_tilt_protection", False)
+        if not self.has_parameter("enable_command_timeout_stand_hold"):
+            self.declare_parameter("enable_command_timeout_stand_hold", False)
+        if not self.has_parameter("max_tilt_rad"):
+            self.declare_parameter("max_tilt_rad", 0.75)
+        self.enable_tilt_protection = bool(
+            self.get_parameter("enable_tilt_protection").value
+        )
+        self.enable_command_timeout_stand_hold = bool(
+            self.get_parameter("enable_command_timeout_stand_hold").value
+        )
+        self.max_tilt_rad = float(self.get_parameter("max_tilt_rad").value)
+        if (
+            not np.isfinite(self.max_tilt_rad)
+            or self.max_tilt_rad <= 0.0
+            or self.max_tilt_rad >= 1.57
+        ):
+            raise RuntimeError("max_tilt_rad must be finite and in (0, pi/2)")
 
         self._install_state_capture_hooks()
 
@@ -186,6 +213,178 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
                 "budget. Verify the motor-driver current limit separately before "
                 "ground testing; this node does not guess an ampere value."
             )
+            self.get_logger().warn(
+                "[PARITY_FIXED][SIM2REAL] model command/action/PD path is kept "
+                "unchanged; extra timeout stand hold is "
+                f"{self.enable_command_timeout_stand_hold}."
+            )
+
+    @staticmethod
+    def _tilt_from_observation(obs: np.ndarray) -> float:
+        """Return body tilt from projected gravity, or +inf if invalid."""
+        obs_flat = np.asarray(obs, dtype=np.float32).reshape(-1)
+        if obs_flat.size < 9:
+            return float("inf")
+        gravity = obs_flat[6:9]
+        norm = float(np.linalg.norm(gravity))
+        if norm < 0.5 or not np.all(np.isfinite(gravity)):
+            return float("inf")
+        upright_cos = float(np.clip(-gravity[2] / norm, -1.0, 1.0))
+        return float(np.arccos(upright_cos))
+
+    def _write_protected_cycle(
+        self,
+        obs: np.ndarray,
+        info: dict,
+        max_age: float,
+        target_real: np.ndarray,
+        target_real_raw: np.ndarray,
+        torque_limit_info: dict,
+        mode: str,
+        reason: str,
+    ) -> bool:
+        """Send and record one non-policy safety target."""
+        current_q = np.asarray(info["q_real"], dtype=np.float32).reshape(12)
+        current_dq = np.asarray(info["dq_real"], dtype=np.float32).reshape(12)
+        zeros = np.zeros(12, dtype=np.float32)
+        send_ok = True
+        send_meta = self._empty_send_meta()
+        if self.enable_send:
+            send_ok = self.send_motion_batch(
+                target_real,
+                info,
+                motor_vel_cmd=zeros,
+                motor_torque_ff=torque_limit_info.get(
+                    "torque_ff_cmd",
+                    np.full(
+                        12,
+                        float(self.send_torque),
+                        dtype=np.float32,
+                    ),
+                ),
+            )
+            send_meta = dict(self._last_send_meta)
+        else:
+            send_meta.update(
+                {
+                    "send_attempted": False,
+                    "send_ok": True,
+                    "send_error": "preview_no_send",
+                }
+            )
+
+        phase = float(getattr(self.obs_builder, "last_gait_phase", 0.0))
+        self.publish_array(self.pub_target, target_real)
+        self.maybe_write_policy_csv(
+            obs=obs,
+            action_raw=zeros,
+            action_policy_obs=zeros,
+            action=zeros,
+            q_des=target_real,
+            current_q=current_q,
+            current_dq=current_dq,
+            error=np.asarray(target_real, dtype=np.float32) - current_q,
+            max_age=max_age,
+            measured_torque=info.get("torque_real"),
+            motor_temp=info.get("temp_real"),
+            motor_online=info.get("online"),
+            motor_error_code=info.get("error_code"),
+            motor_age_ms=info.get("age_ms"),
+            q_raw_des=target_real_raw,
+            q_smooth_des=target_real,
+            motor_vel_cmd=zeros,
+            smoothing_info=self._disabled_pre_limit_info(
+                target_real_raw,
+                current_q,
+                self.compute_torque_safety_budget_nm(),
+            ),
+            torque_limit_info=torque_limit_info,
+            cpg_action_info={
+                "action_mode": mode,
+                "command_gate_scale": 0.0,
+                "zero_cmd_stand": True,
+                "frequency": 0.0,
+                "phase": phase,
+                "base_phase": float(getattr(self, "_contract_phase", 0.0)),
+                "phase_lead_sec": float(getattr(self, "gait_phase_lead_sec", 0.0)),
+                "gait_gate": 0.0,
+                "model_gait_period_s": float(
+                    getattr(self, "model_gait_phase_period", 0.0)
+                ),
+                "gait_period_scale": float(
+                    getattr(self, "contract_gait_period_scale", 1.0)
+                ),
+                "active_gait_period_s": float(getattr(self, "gait_phase_period", 0.0)),
+                "gait_offset_policy": zeros,
+                "protection_reason": reason,
+                "send_meta": send_meta,
+            },
+            mode=mode,
+        )
+        return bool(send_ok)
+
+    def _handle_stale_command(self, obs: np.ndarray, info: dict, max_age: float) -> None:
+        """Keep the robot supported after command publisher loss."""
+        if not self._stale_command_hold_active:
+            self._stale_command_hold_active = True
+            self._tilt_protection_active = False
+            self._reset_contract_state(reset_phase=False)
+            self.get_logger().error(
+                "[SAFE][CMD_TIMEOUT] /cmd_vel is stale; switching to continuous "
+                "default-stand hold. Publish a fresh non-zero command to resume."
+            )
+
+        current_q = np.asarray(info["q_real"], dtype=np.float32).reshape(12)
+        current_dq = np.asarray(info["dq_real"], dtype=np.float32).reshape(12)
+        target_raw = self.default_stand_target_real_order()
+        target, limit_info = self._apply_pd_equivalent_limit(
+            target_raw,
+            current_q,
+            current_dq,
+        )
+        limit_info = dict(limit_info)
+        limit_info["protection_mode"] = "stale_command_pd_equivalent"
+        self._write_protected_cycle(
+            obs,
+            info,
+            max_age,
+            target,
+            target_raw,
+            limit_info,
+            "stale_cmd_stand",
+            "cmd_vel_missing_or_stale",
+        )
+
+    def _handle_tilt_protection(self, obs: np.ndarray, info: dict, max_age: float) -> None:
+        """Stop walking targets and damp the measured pose after excessive tilt."""
+        if not self._tilt_protection_active:
+            self._tilt_protection_active = True
+            self._reset_contract_state(reset_phase=False)
+            self.get_logger().error(
+                "[SAFE][TILT] excessive or invalid projected gravity; "
+                "holding the measured pose and freezing policy state."
+            )
+
+        current_q = np.asarray(info["q_real"], dtype=np.float32).reshape(12)
+        current_dq = np.asarray(info["dq_real"], dtype=np.float32).reshape(12)
+        target_raw = current_q.copy()
+        target, limit_info = self._apply_pd_equivalent_limit(
+            target_raw,
+            current_q,
+            current_dq,
+        )
+        limit_info = dict(limit_info)
+        limit_info["protection_mode"] = "tilt_hold_current_pose"
+        self._write_protected_cycle(
+            obs,
+            info,
+            max_age,
+            target,
+            target_raw,
+            limit_info,
+            "tilt_hold",
+            "tilt_or_invalid_gravity",
+        )
 
     @staticmethod
     def _empty_send_meta() -> dict[str, Any]:
@@ -323,7 +522,13 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
         self.contract_action_filter.action[:] = action
         self.contract_action_filter.action_velocity[:] = velocity
 
-    def send_motion_batch(self, target_real: np.ndarray, info: dict, motor_vel_cmd=None):
+    def send_motion_batch(
+        self,
+        target_real: np.ndarray,
+        info: dict,
+        motor_vel_cmd=None,
+        motor_torque_ff=None,
+    ):
         """Send one policy command and retain complete HTTP/server diagnostics."""
         target_real = np.asarray(target_real, dtype=np.float32).reshape(12)
         q_real = np.asarray(info["q_real"], dtype=np.float32).reshape(12)
@@ -331,6 +536,17 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             motor_vel_cmd = np.full(12, float(self.send_speed), dtype=np.float32)
         else:
             motor_vel_cmd = np.asarray(motor_vel_cmd, dtype=np.float32).reshape(12)
+        if motor_torque_ff is None:
+            motor_torque_ff = np.full(
+                12,
+                float(self.send_torque),
+                dtype=np.float32,
+            )
+        else:
+            motor_torque_ff = np.asarray(
+                motor_torque_ff,
+                dtype=np.float32,
+            ).reshape(12)
 
         meta = self._empty_send_meta()
         meta["send_attempted"] = True
@@ -343,6 +559,12 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
         if not np.all(np.isfinite(motor_vel_cmd)):
             meta["send_error"] = "velocity_target_has_nan_or_inf"
             self.get_logger().warn("[PARITY_FIXED][SEND] velocity has NaN/Inf; skipped")
+            return False
+        if not np.all(np.isfinite(motor_torque_ff)):
+            meta["send_error"] = "torque_feedforward_has_nan_or_inf"
+            self.get_logger().warn(
+                "[PARITY_FIXED][SEND] torque feed-forward has NaN/Inf; skipped"
+            )
             return False
 
         delta = target_real - q_real
@@ -364,7 +586,7 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
                     "motor_id": int(mid),
                     "position": float(target_real[i]),
                     "speed": float(motor_vel_cmd[i]),
-                    "torque": float(self.send_torque),
+                    "torque": float(motor_torque_ff[i]),
                     "kp": float(self.send_kp_real[i]),
                     "kd": float(self.send_kd_real[i]),
                 }
@@ -500,6 +722,13 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             torque_limit_info.get("tau_safe_signed", np.zeros(12, dtype=np.float32)),
             dtype=np.float32,
         ).reshape(12)
+        command_torque_ff = np.asarray(
+            torque_limit_info.get(
+                "torque_ff_cmd",
+                np.full(12, float(self.send_torque), dtype=np.float32),
+            ),
+            dtype=np.float32,
+        ).reshape(12)
         limited_mask = np.asarray(
             torque_limit_info.get("limited_mask", np.zeros(12, dtype=bool)),
             dtype=bool,
@@ -508,6 +737,10 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
 
         sync = dict(cpg.get("estimator_sync", {}))
         send = dict(cpg.get("send_meta", {}))
+        gravity = np.zeros(3, dtype=np.float32)
+        obs_flat = np.asarray(obs, dtype=np.float32).reshape(-1)
+        if obs_flat.size >= 9:
+            gravity[:] = obs_flat[6:9]
         row = [
             f"{now:.6f}",
             self._csv_cycle_sequence,
@@ -542,6 +775,10 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             f"{float(send.get('server_total_ms', 0.0)):.3f}",
             int(send.get("num_spi_frames", 0)),
             int(bool(send.get("batch_active", False))),
+            f"{float(gravity[0]):.6f}",
+            f"{float(gravity[1]):.6f}",
+            f"{float(gravity[2]):.6f}",
+            f"{self._tilt_from_observation(obs_flat):.6f}",
         ]
         for i in range(12):
             row.extend(
@@ -560,6 +797,7 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
                     f"{float(current_dq[i]):.6f}",
                     f"{float(raw_pd_torque[i]):.6f}",
                     f"{float(limited_torque[i]):.6f}",
+                    f"{float(command_torque_ff[i]):.6f}",
                     f"{float(measured_torque[i]):.6f}",
                     int(limited_mask[i]),
                     int(motor_online[i]),
@@ -610,6 +848,33 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             if self._startup_stand_state != "complete":
                 self.handle_startup_stand(obs, info, measured_dt, max_age)
                 return
+
+            # Keep the policy running on the current command by default, just
+            # as the simulation does between command segments. An explicit
+            # timeout stand-hold remains available as a real-machine option.
+            if not self.command_is_fresh():
+                if self.enable_command_timeout_stand_hold:
+                    self._handle_stale_command(obs, info, max_age)
+                    return
+                # Simulation keeps its current command until the next command
+                # segment. Preserve that behavior when the real publisher has
+                # a gap; the fast command publisher sends an explicit zero at
+                # the end of its sequence.
+                self._stale_command_hold_active = False
+
+            self._stale_command_hold_active = False
+            tilt_rad = self._tilt_from_observation(obs)
+            if self.enable_tilt_protection and tilt_rad > self.max_tilt_rad:
+                self._handle_tilt_protection(obs, info, max_age)
+                return
+            if self._tilt_protection_active:
+                self._tilt_protection_active = False
+                self._reset_contract_state(reset_phase=True)
+                self.get_logger().warn(
+                    "[SAFE][TILT] projected gravity recovered; resuming only "
+                    "after a fresh command state reset."
+                )
+
             if self.stand_only:
                 self.handle_stand_only(obs, info, max_age)
                 return
@@ -697,7 +962,7 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
                 )
             else:
                 active_limits = self._active_torque_limits_real()
-                target_real, torque_limit_info = self.contract_torque_limiter.limit(
+                target_real, torque_limit_info = self.contract_torque_limiter.limit_with_torque_feedforward(
                     q_raw=target_real_raw,
                     q_current=current_q,
                     dq_current=current_dq,
@@ -706,6 +971,7 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
                     torque_limits=active_limits,
                     qd_target=np.zeros(12, dtype=np.float32),
                     torque_ff=np.zeros(12, dtype=np.float32),
+                    torque_ff_limit=self.motion_torque_ff_limit_nm,
                 )
                 torque_limit_info["joint_limit_adjusted_mask"] = np.zeros(
                     12, dtype=bool
@@ -721,29 +987,20 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             send_meta = self._empty_send_meta()
             send_ok = True
             if self.enable_send:
-                if self.command_is_fresh():
-                    send_ok = self.send_motion_batch(
-                        target_real,
-                        info,
-                        motor_vel_cmd=motor_vel_cmd,
-                    )
-                    send_meta = dict(self._last_send_meta)
-                else:
-                    send_ok = False
-                    send_meta.update(
-                        {
-                            "send_attempted": False,
-                            "send_ok": False,
-                            "send_error": "cmd_vel_missing_or_stale",
-                        }
-                    )
-                    now = time.time()
-                    if now - self._last_cmd_timeout_log_time >= 1.0:
-                        self._last_cmd_timeout_log_time = now
-                        self.get_logger().warn(
-                            "[PARITY_FIXED][SAFE] /cmd_vel missing or stale; "
-                            "filter/action/phase frozen"
-                        )
+                send_ok = self.send_motion_batch(
+                    target_real,
+                    info,
+                    motor_vel_cmd=motor_vel_cmd,
+                    motor_torque_ff=torque_limit_info.get(
+                        "torque_ff_cmd",
+                        np.full(
+                            12,
+                            float(self.send_torque),
+                            dtype=np.float32,
+                        ),
+                    ),
+                )
+                send_meta = dict(self._last_send_meta)
             else:
                 # A no-send preview is a valid simulated policy step.
                 send_meta.update(

@@ -85,6 +85,49 @@ def test_pd_equivalent_target_reconstructs_clipped_signed_torque():
     assert info["limited_count"] > 0
 
 
+def test_torque_feedforward_saturation_preserves_learned_target():
+    limiter = PDTorqueEquivalentLimiter()
+    q_current = np.asarray([-1.354] * 12, dtype=np.float32)
+    dq_current = np.asarray([-2.26] * 12, dtype=np.float32)
+    q_raw = np.asarray([-0.966] * 12, dtype=np.float32)
+    kp = np.asarray([70.0] * 12, dtype=np.float32)
+    kd = np.asarray([1.6] * 12, dtype=np.float32)
+
+    q_cmd, info = limiter.limit_with_torque_feedforward(
+        q_raw=q_raw,
+        q_current=q_current,
+        dq_current=dq_current,
+        kp=kp,
+        kd=kd,
+        torque_limits=np.asarray([13.0] * 12, dtype=np.float32),
+        torque_ff_limit=17.0,
+    )
+
+    # The old target-only conversion moved this example by about 0.25 rad.
+    # The RS04 torque field now supplies almost all of the correction and the
+    # remaining target adjustment is only the protocol-range residual.
+    assert float(np.max(np.abs(q_cmd - q_raw))) < 0.02
+    np.testing.assert_allclose(
+        info["tau_final_signed"],
+        np.full(12, 13.0, dtype=np.float32),
+        atol=2.0e-5,
+    )
+    assert float(np.max(np.abs(info["torque_ff_cmd"]))) <= 17.0 + 1.0e-6
+    assert info["limited_count"] == 12
+
+
+def test_symmetric_transition_uses_torque_feedforward_for_pd_saturation():
+    node_file = (
+        Path(__file__).parents[1]
+        / "mydog_policy"
+        / "sim2real_parity_fixed_node.py"
+    )
+    source = node_file.read_text(encoding="utf-8")
+    assert "limit_with_torque_feedforward" in source
+    assert "motor_torque_ff=torque_limit_info.get" in source
+    assert 'f"{safe}_command_torque_ff"' in source
+
+
 def test_parity_launch_disables_legacy_closed_loop_modifiers():
     launch_file = (
         Path(__file__).parents[1]
@@ -102,6 +145,18 @@ def test_parity_launch_disables_legacy_closed_loop_modifiers():
     assert '"gait_phase_lead_sec": LaunchConfiguration("gait_phase_lead_sec")' in source
     assert 'DeclareLaunchArgument("gait_phase_lead_sec", default_value="0.00")' in source
     assert 'DeclareLaunchArgument("motor_torque_limit_nm", default_value="10.0")' in source
+
+
+def test_symmetric_transition_launch_exposes_torque_ff_protocol_limit():
+    launch_file = (
+        Path(__file__).parents[1]
+        / "launch"
+        / "sim2real_symmetric_transition_5530.launch.py"
+    )
+    source = launch_file.read_text(encoding="utf-8")
+    assert '"motion_torque_ff_limit_nm": LaunchConfiguration(' in source
+    assert '"motion_torque_ff_limit_nm",' in source
+    assert 'default_value="17.0"' in source
 
 
 def test_parity_node_applies_only_explicit_gait_period_scaling():
