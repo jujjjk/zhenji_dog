@@ -38,7 +38,9 @@
 /* USER CODE BEGIN PTD */
 
 /* USER CODE BEGIN PD */
-#define BOARD_IS_A              1
+#ifndef BOARD_IS_A
+#define BOARD_IS_A              0
+#endif
 #define MASTER_CAN_ID           0x00FD
 
 #define SPI_FRAME_LEN           96
@@ -48,12 +50,15 @@
 #define SPI_OP_SEND_CAN_RAW     0x10
 #define SPI_OP_REINIT_REPORTS   0x11
 #define SPI_OP_SEND_CAN_BATCH   0x12
+#define SPI_OP_READ_MOTOR_PARAM 0x13
 #define SPI_BATCH_HEADER_LEN    4U
 #define SPI_BATCH_ENTRY_LEN     13U
 #define SPI_BATCH_MAX_ENTRIES   7U
 
 #define SNAPSHOT_MAGIC          0x5A
+#define PARAM_RESPONSE_MAGIC    0x5B
 #define SNAPSHOT_CAP_BATCH_CAN  (1UL << 0)
+#define SNAPSHOT_CAP_PARAM_READBACK (1UL << 1)
 #define ONLINE_TIMEOUT_MS       100U
 #define REPORT_RETRY_MS         1000U
 #define REPORT_STALE_MS         500U
@@ -136,8 +141,40 @@ typedef struct __attribute__((packed)) {
     uint32_t reserved;      // 先保留，凑成 96 字节
 } board_snapshot_t;
 
+typedef struct __attribute__((packed)) {
+    uint8_t  magic;         // 0x5B
+    uint8_t  board_tag;     // A1 / B1
+    uint8_t  motor_id;
+    uint8_t  status;        // 0 success, 1 waiting, 2 timeout, 3 bad request
+    uint16_t index;
+    uint16_t reserved0;
+    float    value_f32;
+    uint32_t response_tick_ms;
+    uint8_t  reserved[80];
+} param_response_t;
+
+typedef char board_snapshot_size_check[
+    (sizeof(board_snapshot_t) == SPI_FRAME_LEN) ? 1 : -1
+];
+typedef char param_response_size_check[
+    (sizeof(param_response_t) == SPI_FRAME_LEN) ? 1 : -1
+];
+
+typedef struct {
+    volatile uint8_t  pending;
+    volatile uint8_t  ready;
+    volatile uint8_t  motor_id;
+    volatile uint8_t  status;
+    volatile uint16_t index;
+    volatile float    value_f32;
+    volatile uint32_t request_tick_ms;
+    volatile uint32_t response_tick_ms;
+} param_read_state_t;
+
 static volatile motor_state_t g_motors[6];
 static uint16_t g_snapshot_seq = 0;
+static volatile param_read_state_t g_param_read = {0};
+static uint8_t g_param_response_in_flight = 0;
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -240,6 +277,17 @@ static uint8_t motor_write_param_u16(uint8_t can_id, uint16_t index, uint16_t va
     return can_send_ext(port, ext_id, data);
 }
 
+static uint8_t motor_read_param(uint8_t can_id, uint16_t index)
+{
+    uint8_t port = can_port_from_motor_id(can_id);
+    uint32_t ext_id = build_ext_id(0x11, MASTER_CAN_ID, can_id);
+    uint8_t data[8] = {0};
+
+    data[0] = (uint8_t)(index & 0xFF);
+    data[1] = (uint8_t)((index >> 8) & 0xFF);
+    return can_send_ext(port, ext_id, data);
+}
+
 static uint8_t motor_write_param_u32(uint8_t can_id, uint16_t index, uint32_t value)
 {
     uint8_t port = can_port_from_motor_id(can_id);
@@ -335,6 +383,23 @@ static void parse_motor_feedback(uint32_t ext_id, const uint8_t data[8])
     uint8_t fault    = (ext_id >> 16) & 0x3F;
     uint8_t mode     = (ext_id >> 22) & 0x03;
 
+    // Type 17 (0x11) is a parameter-read response.
+    if (cmd_type == 0x11) {
+        uint16_t index = ((uint16_t)data[1] << 8) | data[0];
+        if (g_param_read.pending &&
+            motor_id == g_param_read.motor_id &&
+            index == g_param_read.index) {
+            float value = 0.0f;
+            memcpy(&value, &data[4], sizeof(value));
+            g_param_read.value_f32 = value;
+            g_param_read.response_tick_ms = HAL_GetTick();
+            g_param_read.status = 0;
+            g_param_read.pending = 0;
+            g_param_read.ready = 1;
+        }
+        return;
+    }
+
     // 兼容 type 2 和 type 24
     if (!(cmd_type == 0x02 || cmd_type == 0x18)) {
         return;
@@ -404,13 +469,39 @@ static void prepare_snapshot_frame(void)
     snap.board_tag     = BOARD_TAG;
     snap.seq           = ++g_snapshot_seq;
     snap.board_tick_ms = now_ms;
-    snap.reserved      = SNAPSHOT_CAP_BATCH_CAN;
+    snap.reserved      = SNAPSHOT_CAP_BATCH_CAN |
+                         SNAPSHOT_CAP_PARAM_READBACK;
 
     for (int i = 0; i < 6; i++) {
         fill_one_motor_snapshot(&snap.motors[i], &local[i], now_ms);
     }
 
     memcpy(txbuff, &snap, sizeof(snap));
+}
+
+static void prepare_param_response_frame(void)
+{
+    param_response_t response;
+    memset(&response, 0, sizeof(response));
+    response.magic = PARAM_RESPONSE_MAGIC;
+    response.board_tag = BOARD_TAG;
+    response.motor_id = g_param_read.motor_id;
+    response.status = g_param_read.status;
+    response.index = g_param_read.index;
+    response.value_f32 = g_param_read.value_f32;
+    response.response_tick_ms = g_param_read.response_tick_ms;
+    memcpy(txbuff, &response, sizeof(response));
+    g_param_response_in_flight = 1;
+}
+
+static void prepare_spi_tx_frame(void)
+{
+    if (g_param_read.ready) {
+        prepare_param_response_frame();
+    } else {
+        g_param_response_in_flight = 0;
+        prepare_snapshot_frame();
+    }
 }
 
 static void handle_spi_command(const uint8_t *rx)
@@ -458,6 +549,37 @@ static void handle_spi_command(const uint8_t *rx)
     case SPI_OP_REINIT_REPORTS:
         motor_config_reports_all();
         break;
+
+    case SPI_OP_READ_MOTOR_PARAM:
+    {
+        uint8_t motor_id = rx[2];
+        uint16_t index = ((uint16_t)rx[5] << 8) | rx[4];
+        if (motor_slot_from_id(motor_id) < 0) {
+            g_param_read.motor_id = motor_id;
+            g_param_read.index = index;
+            g_param_read.value_f32 = 0.0f;
+            g_param_read.response_tick_ms = HAL_GetTick();
+            g_param_read.status = 3;
+            g_param_read.pending = 0;
+            g_param_read.ready = 1;
+            break;
+        }
+        g_param_read.motor_id = motor_id;
+        g_param_read.index = index;
+        g_param_read.value_f32 = 0.0f;
+        g_param_read.request_tick_ms = HAL_GetTick();
+        g_param_read.response_tick_ms = 0;
+        g_param_read.status = 1;
+        g_param_read.ready = 0;
+        g_param_read.pending = 1;
+        if (motor_read_param(motor_id, index) != 0) {
+            g_param_read.status = 3;
+            g_param_read.pending = 0;
+            g_param_read.ready = 1;
+            g_param_read.response_tick_ms = HAL_GetTick();
+        }
+        break;
+    }
 
     case SPI_OP_NOP:
     default:
@@ -518,7 +640,7 @@ int main(void)
 
   memset(rxbuff, 0, sizeof(rxbuff));
   memset(txbuff, 0, sizeof(txbuff));
-  prepare_snapshot_frame();
+  prepare_spi_tx_frame();
 
  // 给电机一点上电稳定时间，然后打开主动上报
   HAL_Delay(50);
@@ -545,8 +667,16 @@ int main(void)
         }
     }
 
-    // 先把“当前最新快照”准备好
-    prepare_snapshot_frame();
+    if (g_param_read.pending &&
+        (now - g_param_read.request_tick_ms) > 100U) {
+        g_param_read.status = 2;
+        g_param_read.pending = 0;
+        g_param_read.ready = 1;
+        g_param_read.response_tick_ms = now;
+    }
+
+    // 先准备当前快照，或一次性参数读回响应。
+    prepare_spi_tx_frame();
 
     // NX 发 96 字节过来时，会在同一帧收到当前 snapshot
     if ((now - last_report_retry_ms) > REPORT_RETRY_MS) {
@@ -566,6 +696,11 @@ int main(void)
     }
 
     HAL_SPI_TransmitReceive(&hspi1, txbuff, rxbuff, SPI_FRAME_LEN, 0xFFFF);
+
+    if (g_param_response_in_flight) {
+        g_param_read.ready = 0;
+        g_param_response_in_flight = 0;
+    }
 
     // 如有命令，则顺手处理
     handle_spi_command(rxbuff);

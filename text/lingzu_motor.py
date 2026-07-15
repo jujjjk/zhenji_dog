@@ -22,6 +22,7 @@ CMD_SET_ZERO    = 0x06
 IDX_RUN_MODE      = 0x7005
 IDX_IQ_REF        = 0x7006
 IDX_SPEED_REF     = 0x700A
+IDX_TORQUE_LIMIT  = 0x700B
 IDX_POS_REF       = 0x7016
 IDX_CSP_V_LIMIT   = 0x7017
 IDX_CUR_LIMIT     = 0x7018
@@ -46,15 +47,18 @@ SPI_CMD_MAGIC     = 0xFA
 SPI_OP_NOP        = 0x00
 SPI_OP_SEND_CAN   = 0x10
 SPI_OP_SEND_CAN_BATCH = 0x12
+SPI_OP_READ_MOTOR_PARAM = 0x13
 
 SPI_BATCH_HEADER_LEN = 4
 SPI_BATCH_ENTRY_LEN = 13
 SPI_BATCH_MAX_ENTRIES = (SPI_FRAME_LEN - SPI_BATCH_HEADER_LEN) // SPI_BATCH_ENTRY_LEN
 
 SNAPSHOT_MAGIC    = 0x5A
+PARAM_RESPONSE_MAGIC = 0x5B
 BOARD_A_TAG       = 0xA1
 BOARD_B_TAG       = 0xB1
 SNAPSHOT_CAP_BATCH_CAN = 1 << 0
+SNAPSHOT_CAP_PARAM_READBACK = 1 << 1
 
 DEFAULT_SPI_MAX_SPEED_HZ = int(os.environ.get("LINGZU_SPI_MAX_SPEED_HZ", "4000000"))
 DEFAULT_SPI_PERSISTENT_OPEN = os.environ.get("LINGZU_SPI_PERSISTENT_OPEN", "1").lower() not in ("0", "false", "no")
@@ -113,6 +117,16 @@ def build_spi_can_frame(can_port: int, ext_id: int, data8: bytes) -> bytes:
     frame[3] = 0x00
     frame[4:8] = int(ext_id).to_bytes(4, "little")
     frame[8:16] = bytes(data8)
+    return bytes(frame)
+
+
+def build_spi_param_read_frame(motor_id: int, index: int) -> bytes:
+    frame = bytearray(SPI_FRAME_LEN)
+    frame[0] = SPI_CMD_MAGIC
+    frame[1] = SPI_OP_READ_MOTOR_PARAM
+    frame[2] = int(motor_id) & 0xFF
+    frame[4] = int(index) & 0xFF
+    frame[5] = (int(index) >> 8) & 0xFF
     return bytes(frame)
 
 
@@ -300,6 +314,21 @@ class LingZuMotorController:
             "motors": motors,
         }
 
+    @staticmethod
+    def _parse_param_response_frame(frame: bytes):
+        if len(frame) != SPI_FRAME_LEN or frame[0] != PARAM_RESPONSE_MAGIC:
+            return None
+        if frame[1] not in (BOARD_A_TAG, BOARD_B_TAG):
+            return None
+        return {
+            "board_tag": int(frame[1]),
+            "motor_id": int(frame[2]),
+            "status": int(frame[3]),
+            "index": int.from_bytes(frame[4:6], "little"),
+            "value": float(struct.unpack_from("<f", frame, 8)[0]),
+            "response_tick_ms": int.from_bytes(frame[12:16], "little"),
+        }
+
     @classmethod
     def _apply_snapshot_to_registry(cls, snap: dict | None):
         if not snap:
@@ -378,6 +407,77 @@ class LingZuMotorController:
         ext_id = build_ext_id(CMD_GET_PARAM, MASTER_ID, self.motor_id)
         self._send(ext_id, bytes(data))
 
+    def read_param_f32(self, index: int, timeout: float = 0.35) -> float:
+        """Read a float parameter through STM32's verified response channel."""
+        if not (
+            self.state.board_capabilities & SNAPSHOT_CAP_PARAM_READBACK
+        ):
+            self.refresh_board_snapshot()
+        if not (
+            self.state.board_capabilities & SNAPSHOT_CAP_PARAM_READBACK
+        ):
+            raise RuntimeError(
+                "STM32 firmware lacks parameter-readback capability; flash "
+                "the updated DOG_0.1A firmware on both boards"
+            )
+        target, _ = motor_to_target_and_port(self.motor_id)
+        request = build_spi_param_read_frame(self.motor_id, index)
+        deadline = time.monotonic() + max(0.05, float(timeout))
+
+        # Hold the shared SPI lock for request + polls so the state-refresh
+        # thread cannot consume the one-shot 0x5B response frame.
+        with self.transport.lock:
+            rx = self.transport._xfer_to_one(target[0], target[1], request)
+            snap = self._parse_snapshot_frame(rx)
+            self._apply_snapshot_to_registry(snap)
+            while time.monotonic() < deadline:
+                time.sleep(0.005)
+                rx = self.transport._xfer_to_one(
+                    target[0],
+                    target[1],
+                    build_spi_nop_frame(),
+                )
+                response = self._parse_param_response_frame(rx)
+                if response is not None:
+                    if (
+                        response["motor_id"] != int(self.motor_id)
+                        or response["index"] != int(index)
+                    ):
+                        continue
+                    if response["status"] != 0:
+                        raise RuntimeError(
+                            "motor parameter read failed: "
+                            f"motor=0x{self.motor_id:02X}, "
+                            f"index=0x{index:04X}, status={response['status']}"
+                        )
+                    if not float("-inf") < response["value"] < float("inf"):
+                        raise RuntimeError("motor parameter read returned non-finite value")
+                    return float(response["value"])
+                snap = self._parse_snapshot_frame(rx)
+                self._apply_snapshot_to_registry(snap)
+        raise TimeoutError(
+            f"parameter readback timeout: motor=0x{self.motor_id:02X}, "
+            f"index=0x{index:04X}"
+        )
+
+    def write_and_verify_param_f32(
+        self,
+        index: int,
+        value: float,
+        *,
+        atol: float = 0.05,
+    ) -> float:
+        self.set_param_f32(index, value)
+        time.sleep(0.01)
+        actual = self.read_param_f32(index)
+        if abs(float(actual) - float(value)) > float(atol):
+            raise RuntimeError(
+                f"parameter verify mismatch motor=0x{self.motor_id:02X} "
+                f"index=0x{index:04X}: requested={float(value):.4f}, "
+                f"readback={float(actual):.4f}"
+            )
+        return float(actual)
+
     def set_param_u8(self, index: int, value: int):
         data = bytearray(8)
         data[0] = index & 0xFF
@@ -400,6 +500,13 @@ class LingZuMotorController:
 
     def set_current_limit(self, amp: float):
         self.set_param_f32(IDX_CUR_LIMIT, amp)
+
+    def set_torque_limit(self, torque_nm: float):
+        """Set RS01's volatile internal total-torque limit (index 0x700B)."""
+        torque_nm = float(torque_nm)
+        if not 0.0 < torque_nm <= T_MAX:
+            raise ValueError(f"torque limit must be in (0, {T_MAX}] Nm")
+        self.set_param_f32(IDX_TORQUE_LIMIT, torque_nm)
 
     def set_motion_mode(self):
         self.set_mode(MODE_MOTION)

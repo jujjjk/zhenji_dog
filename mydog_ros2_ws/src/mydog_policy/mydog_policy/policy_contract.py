@@ -334,3 +334,97 @@ class PDTorqueEquivalentLimiter:
             "err_limit_min": float(np.min(np.abs(q_cmd - q_current))),
             "err_limit_max": float(np.max(np.abs(q_cmd - q_current))),
         }
+
+    def limit_with_hardware_torque_saturation(
+        self,
+        q_raw: np.ndarray,
+        q_current: np.ndarray,
+        dq_current: np.ndarray,
+        kp: np.ndarray,
+        kd: np.ndarray,
+        torque_limits: np.ndarray | float,
+        qd_target: np.ndarray | None = None,
+        torque_ff: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Describe RS01-internal torque saturation without changing commands.
+
+        RS01 motion mode evaluates the PD law continuously inside the motor and
+        exposes ``limit_torque`` (private-protocol index 0x700B).  Configuring
+        that parameter to the training limit is the closest hardware analogue
+        of clipping the simulated PD torque every physics step.  In contrast,
+        cancelling excess PD torque with one fixed feed-forward value per
+        20 ms policy frame under-drives the joint as soon as its state changes.
+
+        This method therefore preserves the learned position target and the
+        caller's feed-forward command.  ``tau_safe_signed`` is diagnostic: it
+        is the torque expected after the already-configured motor limit.
+        """
+        q_raw = np.asarray(q_raw, dtype=np.float32).reshape(12)
+        q_current = np.asarray(q_current, dtype=np.float32).reshape(12)
+        dq_current = np.asarray(dq_current, dtype=np.float32).reshape(12)
+        kp = np.abs(np.asarray(kp, dtype=np.float32).reshape(12))
+        kd = np.abs(np.asarray(kd, dtype=np.float32).reshape(12))
+        limits = _vector(torque_limits, 12, name="torque_limits", default=1.0e9)
+        qd_target = (
+            np.zeros(12, dtype=np.float32)
+            if qd_target is None
+            else np.asarray(qd_target, dtype=np.float32).reshape(12)
+        )
+        torque_ff = (
+            np.zeros(12, dtype=np.float32)
+            if torque_ff is None
+            else np.asarray(torque_ff, dtype=np.float32).reshape(12)
+        )
+
+        for name, arr in (
+            ("q_raw", q_raw),
+            ("q_current", q_current),
+            ("dq_current", dq_current),
+            ("kp", kp),
+            ("kd", kd),
+            ("qd_target", qd_target),
+            ("torque_ff", torque_ff),
+        ):
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(f"{name} must be finite")
+        if np.any(kp <= 1.0e-6):
+            raise ValueError("kp must be positive")
+        if np.any(limits <= 0.0):
+            raise ValueError("torque_limits must be positive")
+
+        velocity_error = qd_target - dq_current
+        requested_torque = (
+            kp * (q_raw - q_current)
+            + kd * velocity_error
+            + torque_ff
+        )
+        target_torque = np.clip(requested_torque, -limits, limits)
+        limited_mask = np.abs(requested_torque - target_torque) > 1.0e-6
+        false_mask = np.zeros(12, dtype=bool)
+
+        return q_raw.copy(), {
+            "enabled": True,
+            "hardware_torque_limit_required": True,
+            "limited_count": int(np.count_nonzero(limited_mask)),
+            "limited_mask": limited_mask,
+            "target_adjusted_count": 0,
+            "target_adjusted_mask": false_mask,
+            "torque_budget": float(np.max(limits)),
+            "torque_limits": limits.astype(np.float32),
+            "tau_raw_signed": requested_torque.astype(np.float32),
+            "tau_pd_signed": (
+                requested_torque - torque_ff
+            ).astype(np.float32),
+            "tau_safe_signed": target_torque.astype(np.float32),
+            "tau_final_signed": target_torque.astype(np.float32),
+            "torque_ff_needed": np.zeros(12, dtype=np.float32),
+            "torque_ff_cmd": torque_ff.astype(np.float32),
+            "tau_reconstructed_signed": target_torque.astype(np.float32),
+            "tau_est": np.abs(target_torque).astype(np.float32),
+            "tau_est_max": float(np.max(np.abs(target_torque))),
+            "raw_delta": (q_raw - q_current).astype(np.float32),
+            "safe_delta": (q_raw - q_current).astype(np.float32),
+            "err_limit": np.abs(q_raw - q_current).astype(np.float32),
+            "err_limit_min": float(np.min(np.abs(q_raw - q_current))),
+            "err_limit_max": float(np.max(np.abs(q_raw - q_current))),
+        }

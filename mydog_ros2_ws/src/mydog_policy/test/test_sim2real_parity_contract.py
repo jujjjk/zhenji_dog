@@ -116,6 +116,38 @@ def test_torque_feedforward_saturation_preserves_learned_target():
     assert info["limited_count"] == 12
 
 
+def test_rs01_hardware_saturation_preserves_target_and_zero_feedforward():
+    limiter = PDTorqueEquivalentLimiter()
+    q_current = np.zeros(12, dtype=np.float32)
+    dq_current = np.linspace(-2.0, 2.0, 12, dtype=np.float32)
+    q_raw = np.linspace(-0.4, 0.4, 12, dtype=np.float32)
+    kp = np.asarray([60.0, 70.0, 70.0] * 4, dtype=np.float32)
+    kd = np.asarray([1.2, 1.6, 1.6] * 4, dtype=np.float32)
+    limits = np.asarray([10.0, 10.0, 13.0] * 4, dtype=np.float32)
+
+    q_cmd, info = limiter.limit_with_hardware_torque_saturation(
+        q_raw=q_raw,
+        q_current=q_current,
+        dq_current=dq_current,
+        kp=kp,
+        kd=kd,
+        torque_limits=limits,
+    )
+
+    expected_raw = kp * q_raw - kd * dq_current
+    np.testing.assert_array_equal(q_cmd, q_raw)
+    np.testing.assert_array_equal(
+        info["torque_ff_cmd"],
+        np.zeros(12, dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        info["tau_safe_signed"],
+        np.clip(expected_raw, -limits, limits),
+        atol=1.0e-6,
+    )
+    assert info["hardware_torque_limit_required"]
+
+
 def test_symmetric_transition_uses_torque_feedforward_for_pd_saturation():
     node_file = (
         Path(__file__).parents[1]
@@ -126,6 +158,19 @@ def test_symmetric_transition_uses_torque_feedforward_for_pd_saturation():
     assert "limit_with_torque_feedforward" in source
     assert "motor_torque_ff=torque_limit_info.get" in source
     assert 'f"{safe}_command_torque_ff"' in source
+
+
+def test_fixed_node_supports_rs01_internal_torque_saturation():
+    node_file = (
+        Path(__file__).parents[1]
+        / "mydog_policy"
+        / "sim2real_parity_fixed_node.py"
+    )
+    source = node_file.read_text(encoding="utf-8")
+    assert "configure_motion_torque_limits" in source
+    assert "limit_with_hardware_torque_saturation" in source
+    assert "snapshot_tick_lag_a" in source
+    assert "_tick_distance_ms" in source
 
 
 def test_parity_launch_disables_legacy_closed_loop_modifiers():

@@ -11,6 +11,7 @@ import rclpy
 
 from .leg_odometry_robust import RobustLegOdometryEstimator
 from .state_estimator_node import MydogStateEstimatorNode
+from .state_estimator_contract import append_shared_motor_snapshot
 
 
 class MydogStateEstimatorFixedNode(MydogStateEstimatorNode):
@@ -104,12 +105,7 @@ class MydogStateEstimatorFixedNode(MydogStateEstimatorNode):
                 )
                 return
 
-            imu = self.imu.get_latest()
-            if not imu.valid:
-                self.get_logger().warn(
-                    "IMU invalid. Skip estimator frame."
-                )
-                return
+            imu = self.get_fresh_imu()
 
             q_abs_policy, dq_policy = (
                 self.mapper.real_to_policy_abs_q_dq(
@@ -153,7 +149,7 @@ class MydogStateEstimatorFixedNode(MydogStateEstimatorNode):
 
             # 0:10 remains compatible with the original state estimator.
             # 10:17 is consumed by sim2real_parity_fixed_node.
-            state = np.concatenate(
+            state_base = np.concatenate(
                 [
                     result.base_lin_vel,
                     imu.gyro_rad_s.astype(np.float32),
@@ -176,6 +172,7 @@ class MydogStateEstimatorFixedNode(MydogStateEstimatorNode):
                     ),
                 ]
             )
+            state = append_shared_motor_snapshot(state_base, motor)
             self.publish_array(self.pub_state, state)
 
             debug = np.concatenate(
@@ -212,7 +209,7 @@ class MydogStateEstimatorFixedNode(MydogStateEstimatorNode):
                 )
 
         except Exception as exc:
-            self.get_logger().error(
+            self.log_state_error(
                 f"robust fixed state estimator error: {exc}"
             )
 

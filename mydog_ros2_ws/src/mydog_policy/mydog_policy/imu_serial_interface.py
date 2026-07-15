@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import time
 import threading
+import os
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -33,6 +35,8 @@ class ImuSnapshot:
     rpy_deg: np.ndarray
     projected_gravity: np.ndarray
     valid: bool
+    backend_alive: bool = False
+    backend_error: str = ""
 
 
 class ImuSerialInterface:
@@ -59,6 +63,12 @@ class ImuSerialInterface:
         self.running = False
         self.thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
+        self._vendor_threads: list[threading.Thread] = []
+        self._backend_failed = False
+        self._backend_error = ""
+        self._previous_excepthook = None
+        self._process_lock_file = None
+        self._last_backend_error_print = 0.0
 
         self.latest = ImuSnapshot(
             stamp=0.0,
@@ -69,6 +79,7 @@ class ImuSerialInterface:
             rpy_deg=np.zeros(3, dtype=np.float32),
             projected_gravity=np.array([0.0, 0.0, -1.0], dtype=np.float32),
             valid=False,
+            backend_alive=False,
         )
 
         # 如果你的 IMU 安装方向已经和 IsaacLab base_link 一致，这里保持单位阵。
@@ -94,14 +105,43 @@ class ImuSerialInterface:
         if self.running:
             return
 
-        self.imu = YbImuSerial(self.port, debug=self.debug)
+        self._acquire_process_lock()
+        self._install_thread_exception_watchdog()
+        before = {thread.ident for thread in threading.enumerate()}
+        try:
+            self.imu = YbImuSerial(self.port, debug=self.debug)
 
-        # 厂家串口模式需要后台线程解析数据帧
-        self.imu.create_receive_threading()
+            # 厂家串口模式需要后台线程解析数据帧。
+            self.imu.create_receive_threading()
+            time.sleep(0.05)
+            created = [
+                thread
+                for thread in threading.enumerate()
+                if thread.ident not in before
+            ]
+            receive_threads = [
+                thread
+                for thread in created
+                if "receive" in thread.name.lower()
+                or "serial" in thread.name.lower()
+            ]
+            self._vendor_threads = receive_threads or created
+            if not self._vendor_threads:
+                raise RuntimeError(
+                    "YbImuLib did not create a detectable serial receive thread"
+                )
 
-        self.running = True
-        self.thread = threading.Thread(target=self._loop, daemon=True)
-        self.thread.start()
+            self.running = True
+            self.thread = threading.Thread(
+                target=self._loop,
+                name="mydog_imu_snapshot",
+                daemon=True,
+            )
+            self.thread.start()
+        except Exception:
+            self._release_process_lock()
+            self._restore_thread_exception_watchdog()
+            raise
 
         print(f"[IMU] started on {self.port}")
 
@@ -110,10 +150,22 @@ class ImuSerialInterface:
         self.running = False
         if self.thread is not None:
             self.thread.join(timeout=1.0)
+        if self.imu is not None:
+            for name in ("close", "stop", "disconnect"):
+                callback = getattr(self.imu, name, None)
+                if callable(callback):
+                    try:
+                        callback()
+                    except Exception:
+                        pass
+                    break
+        self._restore_thread_exception_watchdog()
+        self._release_process_lock()
         print("[IMU] stopped")
 
     def get_latest(self) -> ImuSnapshot:
         """获取最新 IMU 快照。神经网络节点后面就调用这个函数。"""
+        backend_alive = self._backend_is_alive()
         with self.lock:
             return ImuSnapshot(
                 stamp=self.latest.stamp,
@@ -123,8 +175,86 @@ class ImuSerialInterface:
                 quat_wxyz=self.latest.quat_wxyz.copy(),
                 rpy_deg=self.latest.rpy_deg.copy(),
                 projected_gravity=self.latest.projected_gravity.copy(),
-                valid=self.latest.valid,
+                valid=bool(self.latest.valid and backend_alive),
+                backend_alive=backend_alive,
+                backend_error=self._backend_error,
             )
+
+    def _acquire_process_lock(self) -> None:
+        """Ensure only one project process owns the IMU serial port."""
+        try:
+            import fcntl
+        except ImportError:
+            return
+
+        safe_port = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.port)
+        path = os.path.join("/tmp", f"mydog_imu{safe_port}.lock")
+        handle = open(path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise RuntimeError(
+                f"IMU port {self.port} is already owned by another mydog process"
+            ) from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()} port={self.port}\n")
+        handle.flush()
+        self._process_lock_file = handle
+
+    def _release_process_lock(self) -> None:
+        handle = self._process_lock_file
+        self._process_lock_file = None
+        if handle is None:
+            return
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+    def _install_thread_exception_watchdog(self) -> None:
+        self._previous_excepthook = threading.excepthook
+
+        def hook(args):
+            name = str(getattr(args.thread, "name", ""))
+            if (
+                args.thread in self._vendor_threads
+                or "serial_receive" in name.lower()
+                or "task_serial" in name.lower()
+            ):
+                self._backend_failed = True
+                self._backend_error = (
+                    f"{args.exc_type.__name__}: {args.exc_value}"
+                )
+                with self.lock:
+                    self.latest.valid = False
+                    self.latest.backend_alive = False
+                    self.latest.backend_error = self._backend_error
+            previous = self._previous_excepthook
+            if previous is not None:
+                previous(args)
+
+        threading.excepthook = hook
+
+    def _restore_thread_exception_watchdog(self) -> None:
+        if self._previous_excepthook is not None:
+            threading.excepthook = self._previous_excepthook
+            self._previous_excepthook = None
+
+    def _backend_is_alive(self) -> bool:
+        if self._backend_failed or not self.running:
+            return False
+        return bool(
+            self._vendor_threads
+            and all(thread.is_alive() for thread in self._vendor_threads)
+        )
 
     def get_policy_imu_obs(self):
         """
@@ -147,11 +277,23 @@ class ImuSerialInterface:
             t0 = time.time()
 
             try:
+                if not self._backend_is_alive():
+                    raise RuntimeError(
+                        self._backend_error
+                        or "YbImuLib serial receive thread stopped"
+                    )
                 snapshot = self._read_snapshot()
                 with self.lock:
                     self.latest = snapshot
             except Exception as e:
-                print(f"[IMU] read error: {e}")
+                with self.lock:
+                    self.latest.valid = False
+                    self.latest.backend_alive = False
+                    self.latest.backend_error = str(e)
+                now = time.monotonic()
+                if now - self._last_backend_error_print >= 1.0:
+                    self._last_backend_error_print = now
+                    print(f"[IMU] read error: {e}")
 
             dt = time.time() - t0
             sleep_time = max(0.0, period - dt)
@@ -193,6 +335,7 @@ class ImuSerialInterface:
             rpy_deg=rpy_deg,
             projected_gravity=projected_g_base.astype(np.float32),
             valid=True,
+            backend_alive=True,
         )
 
     @staticmethod

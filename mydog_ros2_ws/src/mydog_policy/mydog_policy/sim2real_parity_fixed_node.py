@@ -27,6 +27,7 @@ import numpy as np
 import rclpy
 
 from .sim2real_parity_node import MydogPolicyParityNode
+from .state_estimator_contract import SHARED_FRAME_SIZE
 
 
 class MydogPolicyParityFixedNode(MydogPolicyParityNode):
@@ -152,6 +153,24 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             self.declare_parameter("zero_lin_vel_on_estimator_mismatch", True)
         if not self.has_parameter("send_failure_warn_count"):
             self.declare_parameter("send_failure_warn_count", 3)
+        if not self.has_parameter("max_estimator_tick_lag_ms"):
+            self.declare_parameter("max_estimator_tick_lag_ms", 35.0)
+        if not self.has_parameter("use_hardware_torque_limits"):
+            self.declare_parameter("use_hardware_torque_limits", False)
+        if not self.has_parameter("require_verified_hardware_limits"):
+            self.declare_parameter("require_verified_hardware_limits", False)
+        if not self.has_parameter("hip_current_limit_amp"):
+            self.declare_parameter("hip_current_limit_amp", 12.0)
+        if not self.has_parameter("thigh_current_limit_amp"):
+            self.declare_parameter("thigh_current_limit_amp", 12.0)
+        if not self.has_parameter("calf_current_limit_amp"):
+            self.declare_parameter("calf_current_limit_amp", 16.0)
+        if not self.has_parameter("critical_state_failure_stop_cycles"):
+            self.declare_parameter("critical_state_failure_stop_cycles", 5)
+        if not self.has_parameter("fail_safe_stop_timeout_sec"):
+            self.declare_parameter("fail_safe_stop_timeout_sec", 0.5)
+        if not self.has_parameter("critical_state_startup_grace_sec"):
+            self.declare_parameter("critical_state_startup_grace_sec", 5.0)
 
         self.max_estimator_snapshot_lag = max(
             0, int(self.get_parameter("max_estimator_snapshot_lag").value)
@@ -162,6 +181,62 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
         self.send_failure_warn_count = max(
             1, int(self.get_parameter("send_failure_warn_count").value)
         )
+        self.max_estimator_tick_lag_ms = float(
+            self.get_parameter("max_estimator_tick_lag_ms").value
+        )
+        if (
+            not np.isfinite(self.max_estimator_tick_lag_ms)
+            or self.max_estimator_tick_lag_ms <= 0.0
+        ):
+            raise RuntimeError("max_estimator_tick_lag_ms must be positive")
+        self.use_hardware_torque_limits = bool(
+            self.get_parameter("use_hardware_torque_limits").value
+        )
+        self.require_verified_hardware_limits = bool(
+            self.get_parameter("require_verified_hardware_limits").value
+        )
+        self.hardware_current_limits_by_type = np.asarray(
+            [
+                float(self.get_parameter("hip_current_limit_amp").value),
+                float(self.get_parameter("thigh_current_limit_amp").value),
+                float(self.get_parameter("calf_current_limit_amp").value),
+            ],
+            dtype=np.float32,
+        )
+        if (
+            not np.all(np.isfinite(self.hardware_current_limits_by_type))
+            or np.any(self.hardware_current_limits_by_type <= 0.0)
+            or np.any(self.hardware_current_limits_by_type > 23.0)
+        ):
+            raise RuntimeError(
+                "hip/thigh/calf current limits must be in (0, 23] A"
+            )
+        self._hardware_torque_limits_configured = False
+        self._hardware_safety_limits_verified = False
+        self.critical_state_failure_stop_cycles = max(
+            1,
+            int(
+                self.get_parameter(
+                    "critical_state_failure_stop_cycles"
+                ).value
+            ),
+        )
+        self.fail_safe_stop_timeout_sec = max(
+            0.1,
+            float(self.get_parameter("fail_safe_stop_timeout_sec").value),
+        )
+        self.critical_state_startup_grace_sec = max(
+            0.0,
+            float(
+                self.get_parameter("critical_state_startup_grace_sec").value
+            ),
+        )
+        self._critical_state_watchdog_started = time.monotonic()
+        self._critical_state_failure_count = 0
+        self._critical_state_seen_valid = False
+        self._critical_fault_latched = False
+        self._critical_stop_sent = False
+        self._critical_stop_last_attempt = 0.0
 
         self._estimator_meta: dict[str, Any] = {}
         self._obs_motor_meta: dict[str, Any] = {}
@@ -257,6 +332,14 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
 
         self._install_state_capture_hooks()
 
+        if self.use_hardware_torque_limits and self.enable_rear_torque_boost:
+            raise RuntimeError(
+                "hardware torque limits are static during policy execution; "
+                "rear torque boost must be disabled"
+            )
+        if self.use_hardware_torque_limits and self.enable_send:
+            self._configure_hardware_torque_limits()
+
         # Parent construction may have selected waiting_feedback because the
         # launch defaults startup_stand_first=true.  In target-only diagnostics
         # no command can be sent, so waiting would otherwise time out forever.
@@ -275,11 +358,18 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             "skipped sends freeze filter state, previous_action and gait phase."
         )
         if self.enable_send:
-            self.get_logger().warn(
-                "[PARITY_FIXED][HARDWARE] motor_torque_limit_nm is a software PD "
-                "budget. Verify the motor-driver current limit separately before "
-                "ground testing; this node does not guess an ampere value."
-            )
+            if self.use_hardware_torque_limits:
+                self.get_logger().warn(
+                    "[PARITY_FIXED][HARDWARE] RS01 internal torque/current "
+                    "limits configured; commands preserve q_target and t_ff=0; "
+                    f"verified={self._hardware_safety_limits_verified}."
+                )
+            else:
+                self.get_logger().warn(
+                    "[PARITY_FIXED][HARDWARE] motor_torque_limit_nm is a software "
+                    "PD budget. Verify the motor-driver current limit separately "
+                    "before ground testing."
+                )
             self.get_logger().warn(
                 "[PARITY_FIXED][SIM2REAL] model command/action/PD path is kept "
                 "unchanged; extra timeout stand hold is "
@@ -317,6 +407,151 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             # to the six rear joints; front joints stay at the model limits.
             limits[6:12] = np.float32(self.rear_torque_boost_nm)
         return limits.astype(np.float32)
+
+    def _configure_hardware_torque_limits(self) -> None:
+        """Configure volatile RS01 torque/current limits before motor sends."""
+        limits = np.asarray(
+            self._active_torque_limits_real(),
+            dtype=np.float32,
+        ).reshape(12)
+        current_limits = np.tile(
+            self.hardware_current_limits_by_type,
+            4,
+        ).astype(np.float32)
+        motor_ids = list(self.obs_builder.mapper.get_real_motor_ids())
+        items = [
+            {
+                "motor_id": int(mid),
+                "torque_limit_nm": float(limits[i]),
+                "current_limit_amp": float(current_limits[i]),
+            }
+            for i, mid in enumerate(motor_ids)
+        ]
+        endpoint = (
+            "configure_verified_motion_safety_limits"
+            if self.require_verified_hardware_limits
+            else "configure_motion_torque_limits"
+        )
+        if not self.require_verified_hardware_limits:
+            items = [
+                {
+                    "motor_id": item["motor_id"],
+                    "torque_limit_nm": item["torque_limit_nm"],
+                }
+                for item in items
+            ]
+        url = f"{self.motor_base_url}/api/rs04/{endpoint}"
+        try:
+            response = self.http_session.post(
+                url,
+                json={"items": items},
+                timeout=max(10.0, float(self.http_timeout) * 50.0),
+            )
+            try:
+                body = response.json()
+            except Exception:
+                body = {}
+            if response.status_code != 200 or not bool(body.get("ok", False)):
+                raise RuntimeError(
+                    f"HTTP {response.status_code}: "
+                    f"{body.get('detail', response.text[:160])}"
+                )
+            returned = body.get("limits", {})
+            if int(body.get("count", 0)) != 12:
+                raise RuntimeError("server did not configure all 12 motors")
+            for mid, expected in zip(motor_ids, limits):
+                returned_item = returned.get(hex(int(mid)))
+                actual = (
+                    returned_item.get("torque_limit_nm")
+                    if isinstance(returned_item, dict)
+                    else returned_item
+                )
+                if actual is None or not np.isclose(
+                    float(actual),
+                    float(expected),
+                    atol=1.0e-5,
+                ):
+                    raise RuntimeError(
+                        f"motor 0x{int(mid):02X} torque-limit service response "
+                        f"mismatch: expected {float(expected):.3f}, got {actual}"
+                    )
+            if self.require_verified_hardware_limits:
+                if not bool(body.get("verified", False)):
+                    raise RuntimeError("server did not verify motor parameters")
+                for mid, expected in zip(motor_ids, current_limits):
+                    returned_item = returned.get(hex(int(mid)))
+                    actual = (
+                        returned_item.get("current_limit_amp")
+                        if isinstance(returned_item, dict)
+                        else None
+                    )
+                    if actual is None or not np.isclose(
+                        float(actual),
+                        float(expected),
+                        atol=0.05,
+                    ):
+                        raise RuntimeError(
+                            f"motor 0x{int(mid):02X} current-limit readback "
+                            f"mismatch: expected {float(expected):.3f}, got {actual}"
+                        )
+        except Exception as exc:
+            self._hardware_torque_limits_configured = False
+            self._hardware_safety_limits_verified = False
+            raise RuntimeError(
+                "RS01 hardware torque-limit handshake failed; refusing to "
+                f"start motor control: {exc}"
+            ) from exc
+
+        self._hardware_torque_limits_configured = True
+        self._hardware_safety_limits_verified = bool(
+            self.require_verified_hardware_limits
+        )
+        self.get_logger().warn(
+            "[PARITY_FIXED][HARDWARE] RS01 volatile safety limits accepted | "
+            f"torque_real_order={limits.tolist()}, "
+            f"current_real_order={current_limits.tolist()}, "
+            f"readback_verified={self._hardware_safety_limits_verified}"
+        )
+
+    def _apply_pd_equivalent_limit(self, q_raw, q_current, dq_current):
+        if not self.use_hardware_torque_limits:
+            return super()._apply_pd_equivalent_limit(
+                q_raw,
+                q_current,
+                dq_current,
+            )
+        if self.enable_send and not self._hardware_torque_limits_configured:
+            raise RuntimeError(
+                "RS01 hardware torque limits are not configured; skip send"
+            )
+        if (
+            self.enable_send
+            and self.require_verified_hardware_limits
+            and not self._hardware_safety_limits_verified
+        ):
+            raise RuntimeError(
+                "RS01 torque/current limits lack verified readback; skip send"
+            )
+
+        limits = self._active_torque_limits_real()
+        q_cmd, info = (
+            self.contract_torque_limiter.limit_with_hardware_torque_saturation(
+                q_raw=q_raw,
+                q_current=q_current,
+                dq_current=dq_current,
+                kp=self.send_kp_real,
+                kd=self.send_kd_real,
+                torque_limits=limits,
+                qd_target=np.zeros(12, dtype=np.float32),
+                torque_ff=np.zeros(12, dtype=np.float32),
+            )
+        )
+        info["joint_limit_adjusted_mask"] = np.zeros(12, dtype=bool)
+        info["rear_torque_boost_active"] = False
+        info["rear_torque_boost_elapsed_s"] = 0.0
+        info["rear_torque_limit_nm"] = float(np.max(limits[6:12]))
+        info["protection_mode"] = "rs01_internal_torque_saturation"
+        return np.asarray(q_cmd, dtype=np.float32), info
 
     def _maybe_activate_rear_torque_boost(
         self,
@@ -555,6 +790,62 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             "batch_active": False,
         }
 
+    def _trip_critical_fault(self, reason: str) -> None:
+        """Latch a state-input fault and issue one all-motor stop request."""
+        if self._critical_fault_latched and self._critical_stop_sent:
+            return
+        now = time.monotonic()
+        if (
+            self._critical_fault_latched
+            and now - self._critical_stop_last_attempt < 1.0
+        ):
+            return
+        self._critical_stop_last_attempt = now
+        self._critical_fault_latched = True
+        self._walking_active_prev = False
+        self._reset_contract_state(reset_phase=True)
+        self.get_logger().fatal(
+            "[PARITY_FIXED][FAIL_SAFE_STOP] critical state input lost; "
+            f"motor control is latched off until node restart: {reason}"
+        )
+        if not self.enable_send or self._critical_stop_sent:
+            return
+        try:
+            motor_ids = list(self.obs_builder.mapper.get_real_motor_ids())
+            response = self.http_session.post(
+                f"{self.motor_base_url}/api/stop",
+                json={"motor_ids": [int(mid) for mid in motor_ids]},
+                timeout=self.fail_safe_stop_timeout_sec,
+            )
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"HTTP {response.status_code}: {response.text[:160]}"
+                )
+            self._critical_stop_sent = True
+            self.get_logger().fatal(
+                "[PARITY_FIXED][FAIL_SAFE_STOP] all 12 RS01 stop commands accepted"
+            )
+        except Exception as exc:
+            self.get_logger().fatal(
+                "[PARITY_FIXED][FAIL_SAFE_STOP] failed to dispatch motor stop; "
+                f"use physical emergency stop immediately: {exc}"
+            )
+
+    def _record_critical_state_failure(self, reason: str) -> None:
+        if (
+            not self._critical_state_seen_valid
+            and
+            time.monotonic() - self._critical_state_watchdog_started
+            < self.critical_state_startup_grace_sec
+        ):
+            return
+        self._critical_state_failure_count += 1
+        if (
+            self._critical_state_failure_count
+            >= self.critical_state_failure_stop_cycles
+        ):
+            self._trip_critical_fault(reason)
+
     def _install_state_capture_hooks(self) -> None:
         """Capture estimator and motor snapshot metadata without replacing ObsBuilder."""
         original_set_state_estimator = self.obs_builder.set_state_estimator
@@ -563,7 +854,7 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             original_set_state_estimator(data)
             arr = np.asarray(data, dtype=np.float32).reshape(-1)
             if arr.size >= self.ESTIMATOR_META_MIN_SIZE:
-                self._estimator_meta = {
+                meta = {
                     "confidence": float(arr[10]),
                     "cache_age_ms": float(arr[11]),
                     "seq_a": int(round(float(arr[12]))) & 0xFFFF,
@@ -573,6 +864,18 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
                     "max_motor_age_ms": float(arr[16]),
                     "received_monotonic": time.monotonic(),
                 }
+                self._estimator_meta = meta
+                if arr.size >= SHARED_FRAME_SIZE:
+                    # q/dq and base state now come from this exact estimator
+                    # snapshot; no independent policy HTTP poll is involved.
+                    self._obs_motor_meta = {
+                        "seq_a": meta["seq_a"],
+                        "seq_b": meta["seq_b"],
+                        "tick_a_ms": meta["tick_a_ms"],
+                        "tick_b_ms": meta["tick_b_ms"],
+                        "cache_age_ms": meta["cache_age_ms"],
+                        "shared_with_estimator": True,
+                    }
             else:
                 self._estimator_meta = {
                     "received_monotonic": time.monotonic(),
@@ -604,6 +907,13 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
         backward = (int(b) - int(a)) & 0xFFFF
         return min(forward, backward)
 
+    @staticmethod
+    def _tick_distance_ms(a: int, b: int) -> int:
+        """Return unsigned STM32 tick distance with 32-bit wrap handling."""
+        forward = (int(a) - int(b)) & 0xFFFFFFFF
+        backward = (int(b) - int(a)) & 0xFFFFFFFF
+        return min(forward, backward)
+
     def _guard_estimator_sync(self, obs: np.ndarray, info: dict):
         """Zero only estimated linear velocity when estimator/motor frames diverge."""
         status = {
@@ -613,6 +923,10 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             "estimator_seq_b": -1,
             "motor_seq_a": int(self._obs_motor_meta.get("seq_a", -1)),
             "motor_seq_b": int(self._obs_motor_meta.get("seq_b", -1)),
+            "estimator_tick_a_ms": -1,
+            "estimator_tick_b_ms": -1,
+            "motor_tick_a_ms": int(self._obs_motor_meta.get("tick_a_ms", -1)),
+            "motor_tick_b_ms": int(self._obs_motor_meta.get("tick_b_ms", -1)),
         }
         meta = self._estimator_meta
         if not meta or meta.get("legacy"):
@@ -629,25 +943,45 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
         est_b = int(meta.get("seq_b", -1))
         mot_a = int(self._obs_motor_meta.get("seq_a", -1))
         mot_b = int(self._obs_motor_meta.get("seq_b", -1))
+        est_tick_a = int(meta.get("tick_a_ms", -1))
+        est_tick_b = int(meta.get("tick_b_ms", -1))
+        mot_tick_a = int(self._obs_motor_meta.get("tick_a_ms", -1))
+        mot_tick_b = int(self._obs_motor_meta.get("tick_b_ms", -1))
         status.update(
             {
                 "estimator_seq_a": est_a,
                 "estimator_seq_b": est_b,
                 "motor_seq_a": mot_a,
                 "motor_seq_b": mot_b,
+                "estimator_tick_a_ms": est_tick_a,
+                "estimator_tick_b_ms": est_tick_b,
+                "motor_tick_a_ms": mot_tick_a,
+                "motor_tick_b_ms": mot_tick_b,
             }
         )
-        if min(est_a, est_b, mot_a, mot_b) < 0:
+        if min(est_tick_a, est_tick_b, mot_tick_a, mot_tick_b) >= 0:
+            tick_lag_a = self._tick_distance_ms(est_tick_a, mot_tick_a)
+            tick_lag_b = self._tick_distance_ms(est_tick_b, mot_tick_b)
+            if max(tick_lag_a, tick_lag_b) <= self.max_estimator_tick_lag_ms:
+                return obs, info, status
+            status["ok"] = False
+            status["reason"] = (
+                f"snapshot_tick_lag_a={tick_lag_a}ms,"
+                f"lag_b={tick_lag_b}ms"
+            )
+        elif min(est_a, est_b, mot_a, mot_b) < 0:
             status["reason"] = "incomplete_snapshot_metadata"
             return obs, info, status
-
-        lag_a = self._seq_distance(est_a, mot_a)
-        lag_b = self._seq_distance(est_b, mot_b)
-        if max(lag_a, lag_b) <= self.max_estimator_snapshot_lag:
-            return obs, info, status
-
-        status["ok"] = False
-        status["reason"] = f"snapshot_lag_a={lag_a},lag_b={lag_b}"
+        else:
+            # Legacy firmware fallback only. Snapshot sequence counts SPI
+            # transactions, not elapsed sensor time, so current firmware must
+            # use board_tick_ms above.
+            lag_a = self._seq_distance(est_a, mot_a)
+            lag_b = self._seq_distance(est_b, mot_b)
+            if max(lag_a, lag_b) <= self.max_estimator_snapshot_lag:
+                return obs, info, status
+            status["ok"] = False
+            status["reason"] = f"legacy_snapshot_lag_a={lag_a},lag_b={lag_b}"
         if self.zero_lin_vel_on_estimator_mismatch:
             obs = np.asarray(obs, dtype=np.float32).copy()
             obs[0:3] = 0.0
@@ -750,6 +1084,12 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             "items": items,
             "enable_first": bool(self.send_enable_first),
             "stop_first": bool(self.send_stop_first),
+            "require_hardware_torque_limits": bool(
+                self.use_hardware_torque_limits
+            ),
+            "require_verified_hardware_safety_limits": bool(
+                self.require_verified_hardware_limits
+            ),
         }
 
         url = f"{self.motor_base_url}/api/rs04/motion_batch_fast"
@@ -974,6 +1314,10 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
         self._last_onnx_infer_dt_ms = 0.0
         filter_state = None
         previous_last_action = None
+        if self._critical_fault_latched:
+            if not self._critical_stop_sent:
+                self._trip_critical_fault("retrying latched fail-safe stop")
+            return
         try:
             measured_dt = self.get_control_dt()
             self.update_smoothed_command(measured_dt)
@@ -996,13 +1340,19 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
                         f"[PARITY_FIXED][SAFE] motor feedback too old: {max_age:.1f} ms; "
                         "cycle not committed"
                     )
+                    self._record_critical_state_failure(
+                        f"motor feedback stale: {max_age:.1f}ms"
+                    )
                     return
 
             if self.require_online and not np.all(info["online"]):
                 self.get_logger().warn(
                     "[PARITY_FIXED][SAFE] some motors offline; cycle not committed"
                 )
+                self._record_critical_state_failure("one or more motors offline")
                 return
+            self._critical_state_failure_count = 0
+            self._critical_state_seen_valid = True
             if self._startup_stand_state != "complete":
                 self.handle_startup_stand(obs, info, measured_dt, max_age)
                 return
@@ -1267,6 +1617,7 @@ class MydogPolicyParityFixedNode(MydogPolicyParityNode):
             self.get_logger().error(
                 f"[PARITY_FIXED] policy loop error; cycle not committed: {exc}"
             )
+            self._record_critical_state_failure(str(exc))
 
 
 def main(args=None):

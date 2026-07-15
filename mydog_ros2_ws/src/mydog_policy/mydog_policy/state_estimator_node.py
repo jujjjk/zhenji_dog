@@ -24,6 +24,7 @@ class MydogStateEstimatorNode(Node):
         self.declare_parameter("require_online", False)
         self.declare_parameter("imu_port", "/dev/myimu")
         self.declare_parameter("imu_read_hz", 100.0)
+        self.declare_parameter("max_imu_sample_age_sec", 0.10)
 
         # From fanfan.urdf + current default stance: Trunk/IMU height is about 0.29 m.
         self.declare_parameter("nominal_base_height", 0.293)
@@ -38,6 +39,11 @@ class MydogStateEstimatorNode(Node):
         self.require_online = bool(self.get_parameter("require_online").value)
         self.imu_port = str(self.get_parameter("imu_port").value)
         self.imu_read_hz = float(self.get_parameter("imu_read_hz").value)
+        self.max_imu_sample_age_sec = float(
+            self.get_parameter("max_imu_sample_age_sec").value
+        )
+        if self.max_imu_sample_age_sec <= 0.0:
+            raise RuntimeError("max_imu_sample_age_sec must be positive")
 
         self.mapper = JointSemanticMapper()
         self.motor = MotorStateHttpInterface(
@@ -60,6 +66,7 @@ class MydogStateEstimatorNode(Node):
             filter_alpha=float(self.get_parameter("filter_alpha").value),
         )
         self._last_info_log_time = 0.0
+        self._last_error_log_time = 0.0
 
         self.pub_base_lin_vel = self.create_publisher(
             Float32MultiArray,
@@ -111,10 +118,7 @@ class MydogStateEstimatorNode(Node):
                 self.get_logger().warn("Some motors offline. Skip estimator frame.")
                 return
 
-            imu = self.imu.get_latest()
-            if not imu.valid:
-                self.get_logger().warn("IMU invalid. Skip estimator frame.")
-                return
+            imu = self.get_fresh_imu()
 
             q_abs_policy, dq_policy = self.mapper.real_to_policy_abs_q_dq(
                 motor.q_real,
@@ -164,7 +168,26 @@ class MydogStateEstimatorNode(Node):
                 )
 
         except Exception as exc:
-            self.get_logger().error(f"state estimator error: {exc}")
+            self.log_state_error(f"state estimator error: {exc}")
+
+    def get_fresh_imu(self):
+        imu = self.imu.get_latest()
+        age_sec = time.time() - float(imu.stamp)
+        if not imu.valid or not imu.backend_alive:
+            detail = imu.backend_error or "serial receive thread is not alive"
+            raise RuntimeError(f"IMU backend invalid: {detail}")
+        if not np.isfinite(age_sec) or age_sec > self.max_imu_sample_age_sec:
+            raise RuntimeError(
+                f"IMU sample stale: age={age_sec:.3f}s > "
+                f"{self.max_imu_sample_age_sec:.3f}s"
+            )
+        return imu
+
+    def log_state_error(self, message: str) -> None:
+        now = time.monotonic()
+        if now - self._last_error_log_time >= 1.0:
+            self._last_error_log_time = now
+            self.get_logger().error(message)
 
     @staticmethod
     def publish_array(pub, arr):

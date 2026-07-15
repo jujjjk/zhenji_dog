@@ -1987,18 +1987,44 @@ class MydogPolicyNode(Node):
                 and not self._startup_stand_enable_sent
             ),
         }
+        if bool(getattr(self, "use_hardware_torque_limits", False)):
+            payload["require_hardware_torque_limits"] = True
+        if bool(getattr(self, "require_verified_hardware_limits", False)):
+            payload["require_verified_hardware_safety_limits"] = True
+        enable_requested = bool(payload["enable_first"])
+        request_timeout = (
+            max(float(self.http_timeout), 0.35)
+            if enable_requested or bool(payload["stop_first"])
+            else self.http_timeout
+        )
         try:
             response = self.http_session.post(
                 f"{self.motor_base_url}/api/rs04/motion_batch_fast",
                 json=payload,
-                timeout=self.http_timeout,
+                timeout=request_timeout,
             )
             if response.status_code != 200:
                 self.get_logger().warn(
                     f"[STARTUP_STAND] HTTP {response.status_code}: {response.text}"
                 )
                 return False
+            body = response.json()
+            if enable_requested and not (
+                bool(body.get("enable_applied", False))
+                and bool(body.get("target_primed", False))
+            ):
+                self.get_logger().error(
+                    "[STARTUP_STAND] motor service did not acknowledge the "
+                    "one-shot target-prime/enable handshake; refusing to "
+                    "advance startup"
+                )
+                return False
             self._startup_stand_enable_sent = True
+            if enable_requested:
+                self.get_logger().warn(
+                    "[STARTUP_STAND] one-shot live-target prime and all-motor "
+                    "ENABLE acknowledged"
+                )
             return True
         except Exception as exc:
             self.get_logger().warn(f"[STARTUP_STAND] send failed: {exc}")

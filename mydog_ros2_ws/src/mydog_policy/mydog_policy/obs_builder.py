@@ -8,6 +8,7 @@ import numpy as np
 
 from .motor_state_interface import MotorStateHttpInterface
 from .semantic_mapper import JointSemanticMapper
+from .state_estimator_contract import unpack_shared_motor_snapshot
 
 
 class ObsBuilder36:
@@ -60,6 +61,7 @@ class ObsBuilder36:
             raise ValueError("base_lin_vel_source must be 'command', 'zero', or 'estimator'")
 
         self.use_internal_imu = self.base_lin_vel_source != "estimator"
+        self.use_external_motor_snapshot = self.base_lin_vel_source == "estimator"
         self.state_estimator_timeout_sec = float(state_estimator_timeout_sec)
 
         self.imu = None
@@ -76,7 +78,12 @@ class ObsBuilder36:
             timeout=0.08,
             stale_recheck_ms=max_motor_age_ms,
             enable_stale_recheck=not bool(motor_state_async),
-            async_poll=bool(motor_state_async),
+            # Estimator mode receives q/dq from the exact snapshot used to
+            # produce base velocity. Keep this object for explicit diagnostic
+            # calls, but do not run a second 50 Hz HTTP polling thread.
+            async_poll=bool(
+                motor_state_async and not self.use_external_motor_snapshot
+            ),
             poll_hz=float(motor_state_poll_hz),
         )
         self.mapper = JointSemanticMapper()
@@ -104,6 +111,7 @@ class ObsBuilder36:
         self.projected_gravity = np.array([0.0, 0.0, -1.0], dtype=np.float32)
         self.state_estimator_stamp = 0.0
         self.state_estimator_valid = False
+        self.external_motor_snapshot = None
 
     def start(self):
         if not self.use_internal_imu:
@@ -230,6 +238,7 @@ class ObsBuilder36:
             self.heading_yaw = float(state[9])
         self.state_estimator_stamp = time.time()
         self.state_estimator_valid = True
+        self.external_motor_snapshot = unpack_shared_motor_snapshot(state)
 
     def _wait_imu_ready(self, timeout=3.0) -> bool:
         start = time.time()
@@ -271,12 +280,46 @@ class ObsBuilder36:
         if not state_valid:
             raise RuntimeError("IMU/state estimator data invalid")
 
-        motor_snapshot = self.motor.get_latest()
-        if not motor_snapshot.valid:
+        shared_motor = self.external_motor_snapshot
+        if self.use_external_motor_snapshot:
+            if shared_motor is None:
+                raise RuntimeError(
+                    "state estimator message lacks the shared motor snapshot"
+                )
+            q_real = shared_motor["q_real"]
+            dq_real = shared_motor["dq_real"]
+            torque_real = shared_motor["torque"]
+            temp_real = shared_motor["temp"]
+            online = shared_motor["online"]
+            error_code = shared_motor["error_code"]
+            estimator_transport_age_ms = max(
+                0.0,
+                (time.time() - self.state_estimator_stamp) * 1000.0,
+            )
+            age_ms = (
+                shared_motor["age_ms"] + estimator_transport_age_ms
+            ).astype(np.float32)
+            motor_valid = bool(
+                np.all(np.isfinite(q_real))
+                and np.all(np.isfinite(dq_real))
+                and np.all(np.isfinite(age_ms))
+            )
+            motor_poll_dt_ms = 0.0
+        else:
+            motor_snapshot = self.motor.get_latest()
+            if not motor_snapshot.valid:
+                raise RuntimeError("Motor state invalid")
+            q_real = motor_snapshot.q_real
+            dq_real = motor_snapshot.dq_real
+            torque_real = motor_snapshot.torque
+            temp_real = motor_snapshot.temp
+            online = motor_snapshot.online
+            error_code = motor_snapshot.error_code
+            age_ms = motor_snapshot.age_ms
+            motor_valid = bool(motor_snapshot.valid)
+            motor_poll_dt_ms = float(motor_snapshot.poll_dt_ms)
+        if not motor_valid:
             raise RuntimeError("Motor state invalid")
-
-        q_real = motor_snapshot.q_real
-        dq_real = motor_snapshot.dq_real
 
         q_policy, dq_policy = self.mapper.real_to_policy_q_dq(
             q_real=q_real,
@@ -310,24 +353,24 @@ class ObsBuilder36:
 
         info = {
             "imu_valid": state_valid,
-            "motor_valid": motor_snapshot.valid,
+            "motor_valid": motor_valid,
             "base_lin_vel": base_lin_vel.copy(),
             "base_ang_vel": base_ang_vel.copy(),
             "projected_gravity": projected_gravity.copy(),
             "cmd": policy_cmd.copy(),
             "q_real": q_real.copy(),
             "dq_real": dq_real.copy(),
-            "torque_real": motor_snapshot.torque.copy(),
-            "temp_real": motor_snapshot.temp.copy(),
+            "torque_real": np.asarray(torque_real).copy(),
+            "temp_real": np.asarray(temp_real).copy(),
             "q_policy": q_policy.copy(),
             "dq_policy": dq_policy.copy(),
             "last_action": self.last_action.copy(),
             "gait_phase": gait_phase_obs.copy(),
             "heading": heading_obs.copy(),
-            "online": motor_snapshot.online.copy(),
-            "error_code": motor_snapshot.error_code.copy(),
-            "age_ms": motor_snapshot.age_ms.copy(),
-            "motor_state_poll_dt_ms": float(motor_snapshot.poll_dt_ms),
+            "online": np.asarray(online).copy(),
+            "error_code": np.asarray(error_code).copy(),
+            "age_ms": np.asarray(age_ms).copy(),
+            "motor_state_poll_dt_ms": motor_poll_dt_ms,
         }
 
         return obs, info

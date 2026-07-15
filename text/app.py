@@ -68,6 +68,21 @@ _state_refresh_stop = threading.Event()
 _state_refresh_thread: threading.Thread | None = None
 _control_timing_lock = threading.Lock()
 _control_send_stamps = deque(maxlen=200)
+_configured_motion_torque_limits: dict[int, float] = {}
+_configured_motion_current_limits: dict[int, float] = {}
+_verified_motion_safety_limits: dict[int, dict[str, float]] = {}
+
+
+def _invalidate_motion_safety_limits(reason: str) -> None:
+    if (
+        _configured_motion_torque_limits
+        or _configured_motion_current_limits
+        or _verified_motion_safety_limits
+    ):
+        print(f"[SAFETY_LIMITS] invalidated: {reason}")
+    _configured_motion_torque_limits.clear()
+    _configured_motion_current_limits.clear()
+    _verified_motion_safety_limits.clear()
 
 
 def _record_control_send_timing() -> dict:
@@ -127,6 +142,8 @@ def _update_state_cache(dt_ms: float):
     cache = {}
     for mid, motor in motors.items():
         cache[hex(mid)] = motor.get_state_dict()
+    if any(not bool(item.get("online", False)) for item in cache.values()):
+        _invalidate_motion_safety_limits("one or more motors offline")
     with _state_cache_lock:
         _state_cache = cache
         _state_cache_stamp = time.time()
@@ -310,6 +327,7 @@ class MotionCmd(BaseModel):
 @app.post("/api/rs04/speed_mode_run_exact")
 def rs04_speed_mode_run_exact(cmd: SpeedExactCmd):
     m = _get_motor(cmd.motor_id)
+    _invalidate_motion_safety_limits("speed_mode_run_exact changed 0x7018")
     m.set_mode(2)
     time.sleep(0.05)
     m.enable()
@@ -380,6 +398,228 @@ class MotionBatchCmd(BaseModel):
     items: list[MotionBatchItem]
     enable_first: bool = True
     stop_first: bool = False
+    require_hardware_torque_limits: bool = False
+    require_verified_hardware_safety_limits: bool = False
+
+
+class MotionTorqueLimitItem(BaseModel):
+    motor_id: int
+    torque_limit_nm: float
+
+
+class MotionTorqueLimitsCmd(BaseModel):
+    items: list[MotionTorqueLimitItem]
+
+
+class MotionSafetyLimitItem(BaseModel):
+    motor_id: int
+    torque_limit_nm: float
+    current_limit_amp: float
+
+
+class MotionSafetyLimitsCmd(BaseModel):
+    items: list[MotionSafetyLimitItem]
+
+
+@app.post("/api/rs04/configure_motion_torque_limits")
+def rs04_configure_motion_torque_limits(cmd: MotionTorqueLimitsCmd):
+    """Configure volatile RS01 0x700B limits before motion-mode control.
+
+    The setting is lost when a motor is power-cycled, so the policy performs
+    this handshake on every launch.  A duplicate or incomplete motor list is
+    rejected to prevent a partially configured robot from starting.
+    """
+    items = list(cmd.items)
+    _invalidate_motion_safety_limits("unverified torque-only configuration")
+    ids = [int(item.motor_id) for item in items]
+    if len(items) != len(MOTOR_IDS) or set(ids) != set(MOTOR_IDS):
+        raise HTTPException(
+            status_code=400,
+            detail="torque-limit configuration must contain all 12 motors exactly once",
+        )
+    if len(ids) != len(set(ids)):
+        raise HTTPException(status_code=400, detail="duplicate motor_id")
+
+    requested = {}
+    for item in items:
+        limit_nm = float(item.torque_limit_nm)
+        if not 0.0 < limit_nm <= 17.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid torque limit for motor 0x{item.motor_id:02X}",
+            )
+        requested[int(item.motor_id)] = limit_nm
+
+    try:
+        for mid in MOTOR_IDS:
+            _get_motor(mid).set_torque_limit(requested[mid])
+    except Exception as exc:
+        _configured_motion_torque_limits.clear()
+        raise HTTPException(
+            status_code=503,
+            detail=f"failed to configure RS01 torque limits: {exc}",
+        ) from exc
+
+    _configured_motion_torque_limits.clear()
+    _configured_motion_torque_limits.update(requested)
+    return {
+        "ok": True,
+        "configured": True,
+        "mode": "rs01_internal_torque_limit",
+        "parameter_index": "0x700B",
+        "count": len(requested),
+        "limits": {
+            hex(mid): _configured_motion_torque_limits[mid]
+            for mid in MOTOR_IDS
+        },
+        "note": (
+            "volatile writes dispatched; policy must repeat after every motor "
+            "power cycle and rack-test the resulting torque response"
+        ),
+    }
+
+
+@app.get("/api/rs04/configured_motion_torque_limits")
+def rs04_configured_motion_torque_limits():
+    configured = len(_configured_motion_torque_limits) == len(MOTOR_IDS)
+    return {
+        "ok": True,
+        "configured": configured,
+        "parameter_index": "0x700B",
+        "count": len(_configured_motion_torque_limits),
+        "limits": {
+            hex(mid): value
+            for mid, value in sorted(_configured_motion_torque_limits.items())
+        },
+    }
+
+
+@app.post("/api/rs04/configure_verified_motion_safety_limits")
+def rs04_configure_verified_motion_safety_limits(
+    cmd: MotionSafetyLimitsCmd,
+):
+    """Write and read back RS01 0x700B and 0x7018 for all 12 motors."""
+    items = list(cmd.items)
+    ids = [int(item.motor_id) for item in items]
+    if (
+        len(items) != len(MOTOR_IDS)
+        or set(ids) != set(MOTOR_IDS)
+        or len(ids) != len(set(ids))
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="safety configuration must contain all 12 motors exactly once",
+        )
+
+    requested = {}
+    for item in items:
+        torque = float(item.torque_limit_nm)
+        current = float(item.current_limit_amp)
+        if not 0.0 < torque <= 17.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid torque limit for motor 0x{item.motor_id:02X}",
+            )
+        if not 0.0 < current <= 23.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid current limit for motor 0x{item.motor_id:02X}",
+            )
+        requested[int(item.motor_id)] = {
+            "torque_limit_nm": torque,
+            "current_limit_amp": current,
+        }
+
+    verified = {}
+    try:
+        for motor in motors.values():
+            motor.stop(clear_error=False)
+        time.sleep(0.02)
+        # Torque is constrained and verified before raising the current ceiling.
+        for mid in MOTOR_IDS:
+            motor = _get_motor(mid)
+            values = requested[mid]
+            torque_actual = motor.write_and_verify_param_f32(
+                0x700B,
+                values["torque_limit_nm"],
+                atol=0.05,
+            )
+            current_actual = motor.write_and_verify_param_f32(
+                0x7018,
+                values["current_limit_amp"],
+                atol=0.05,
+            )
+            verified[mid] = {
+                "torque_limit_nm": torque_actual,
+                "current_limit_amp": current_actual,
+            }
+    except Exception as exc:
+        _configured_motion_torque_limits.clear()
+        _configured_motion_current_limits.clear()
+        _verified_motion_safety_limits.clear()
+        for motor in motors.values():
+            try:
+                motor.stop(clear_error=False)
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=503,
+            detail=f"verified RS01 safety configuration failed: {exc}",
+        ) from exc
+
+    _configured_motion_torque_limits.clear()
+    _configured_motion_torque_limits.update(
+        {mid: values["torque_limit_nm"] for mid, values in verified.items()}
+    )
+    _configured_motion_current_limits.clear()
+    _configured_motion_current_limits.update(
+        {mid: values["current_limit_amp"] for mid, values in verified.items()}
+    )
+    _verified_motion_safety_limits.clear()
+    _verified_motion_safety_limits.update(verified)
+    return {
+        "ok": True,
+        "configured": True,
+        "verified": True,
+        "count": len(verified),
+        "parameter_indices": ["0x700B", "0x7018"],
+        "limits": {hex(mid): verified[mid] for mid in MOTOR_IDS},
+    }
+
+
+@app.get("/api/rs04/verified_motion_safety_limits")
+def rs04_verified_motion_safety_limits():
+    verified = len(_verified_motion_safety_limits) == len(MOTOR_IDS)
+    return {
+        "ok": True,
+        "configured": verified,
+        "verified": verified,
+        "count": len(_verified_motion_safety_limits),
+        "parameter_indices": ["0x700B", "0x7018"],
+        "limits": {
+            hex(mid): values
+            for mid, values in sorted(_verified_motion_safety_limits.items())
+        },
+    }
+
+
+@app.get("/api/rs04/read_param_f32")
+def rs04_read_param_f32(motor_id: int, index: int):
+    if not 0 <= int(index) <= 0xFFFF:
+        raise HTTPException(status_code=400, detail="index must fit uint16")
+    try:
+        value = _get_motor(int(motor_id)).read_param_f32(int(index))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"RS01 parameter read failed: {exc}",
+        ) from exc
+    return {
+        "ok": True,
+        "motor_id": hex(int(motor_id)),
+        "index": hex(int(index)),
+        "value": float(value),
+    }
 
 @app.post("/api/rs04/motion_mode_run_batch")
 def rs04_motion_mode_run_batch(cmd: MotionBatchCmd):
@@ -413,24 +653,92 @@ def rs04_motion_batch_fast(cmd: MotionBatchCmd):
     """
     高频策略控制专用接口。
 
-    这个接口只发送 motion_control，不重复 set_mode，不重复 enable，不 sleep。
+    正常50 Hz周期只发送motion_control。启动站立的第一帧可以通过
+    enable_first执行一次安全初始化：STOP、设置运控模式、在失能状态预写
+    当前姿态目标、ENABLE，然后立即重发同一目标。
 
-    使用前提：
-    1. 电机已经进入运控模式；
-    2. 电机已经 enable；
-    3. 已经完成默认站立；
-    4. ROS2 策略循环只负责连续下发目标角。
+    enable_first之后的策略循环必须将该字段保持为false。
     """
+    if cmd.require_hardware_torque_limits and (
+        len(_configured_motion_torque_limits) != len(MOTOR_IDS)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "RS01 hardware torque limits are not configured; restart the "
+                "5730 policy to repeat the 0x700B handshake"
+            ),
+        )
+    if cmd.require_verified_hardware_safety_limits and (
+        len(_verified_motion_safety_limits) != len(MOTOR_IDS)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "verified RS01 torque/current limits are not active; restart "
+                "the policy after flashing both updated STM32 boards"
+            ),
+        )
     t0 = time.perf_counter()
     t_prepare = time.perf_counter()
     items = list(cmd.items)
+    item_ids = [int(item.motor_id) for item in items]
+    if cmd.enable_first and (
+        len(items) != len(MOTOR_IDS)
+        or set(item_ids) != set(MOTOR_IDS)
+        or len(item_ids) != len(set(item_ids))
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="enable_first requires all 12 motors exactly once",
+        )
     prepare_ms = (time.perf_counter() - t_prepare) * 1000.0
     t_spi = time.perf_counter()
     commands = [
         (_get_motor(item.motor_id), item.torque, item.position, item.speed, item.kp, item.kd)
         for item in items
     ]
-    num_spi_frames = send_motion_control_batch(commands)
+    enable_applied = False
+    stop_applied = False
+    target_primed = False
+    priming_spi_frames = 0
+
+    try:
+        if cmd.stop_first or cmd.enable_first:
+            # enable_first is deliberately self-contained.  The verified
+            # safety handshake stops all motors, so relying on an earlier
+            # enable state is unsafe and caused motors to remain disabled.
+            for item in items:
+                _get_motor(item.motor_id).stop(clear_error=False)
+            stop_applied = True
+
+        if cmd.enable_first:
+            for item in items:
+                _get_motor(item.motor_id).set_mode(0)
+            time.sleep(0.01)
+
+            # Prime the live-pose target while disabled.  Some RS01 revisions
+            # may ignore it until enabled, so send the exact frame again below.
+            priming_spi_frames = send_motion_control_batch(commands)
+            target_primed = True
+
+            for item in items:
+                _get_motor(item.motor_id).enable()
+            time.sleep(0.01)
+            enable_applied = True
+
+        num_spi_frames = send_motion_control_batch(commands)
+    except Exception as exc:
+        if cmd.enable_first or cmd.stop_first:
+            for item in items:
+                try:
+                    _get_motor(item.motor_id).stop(clear_error=False)
+                except Exception:
+                    pass
+        raise HTTPException(
+            status_code=503,
+            detail=f"motion startup handshake failed; all motors stopped: {exc}",
+        ) from exc
     spi_send_ms = (time.perf_counter() - t_spi) * 1000.0
     total_ms = (time.perf_counter() - t0) * 1000.0
     timing = _record_control_send_timing()
@@ -449,8 +757,18 @@ def rs04_motion_batch_fast(cmd: MotionBatchCmd):
         "spi_send_ms": spi_send_ms,
         "total_ms": total_ms,
         "num_spi_frames": num_spi_frames,
+        "priming_spi_frames": priming_spi_frames,
         "num_can_frames": len(items),
         "batch_active": batch_active,
+        "stop_applied": stop_applied,
+        "target_primed": target_primed,
+        "enable_applied": enable_applied,
+        "hardware_torque_limits_active": (
+            len(_configured_motion_torque_limits) == len(MOTOR_IDS)
+        ),
+        "verified_hardware_safety_limits_active": (
+            len(_verified_motion_safety_limits) == len(MOTOR_IDS)
+        ),
         **timing,
     }
 # --------------------------
@@ -499,6 +817,7 @@ class CurrentCmd(BaseModel):
 @app.post("/api/rs04/speed_mode_run")
 def rs04_speed_mode_run(cmd: SpeedCmd):
     m = _get_motor(cmd.motor_id)
+    _invalidate_motion_safety_limits("speed_mode_run changed 0x7018")
     m.set_param_u8(0x7005, 2)
     time.sleep(0.08)
     m.enable()
